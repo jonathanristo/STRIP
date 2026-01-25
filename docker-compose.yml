@@ -54,12 +54,7 @@ services:
     volumes: ["./data:/data"]
     working_dir: /data
   gowitness:
-    image: strip/gowitness:arm64
-    build:
-      context: ./images/gowitness
-      # platforms is optional here on ARM since you’re building locally
-      # platforms: ["linux/arm64"]
-    pull_policy: never
+    image: sensepost/gowitness:latest
     volumes: ["./data:/data"]
     working_dir: /data
   prowler:
