@@ -15,6 +15,12 @@ data/.config/subfinder/provider-config.yaml
 **/*_secret
 **/*credentials*
 
+# Subfinder API keys (real config - don't commit)
+data/.config/subfinder/provider-config.yaml
+
+# Keep example
+!data/.config/subfinder/provider-config.yaml.example
+
 # Scan Outputs (users generate their own)
 data/out/
 data/.cache/
