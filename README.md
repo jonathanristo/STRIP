@@ -41,7 +41,7 @@ domains.txt → subdomain discovery → DNS resolution → port scanning
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/strip.git
+git clone https://github.com/jonathanristo/strip.git
 cd strip
 
 # Create required directories
