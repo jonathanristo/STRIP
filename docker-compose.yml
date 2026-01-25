@@ -1,0 +1,81 @@
+services:
+  subfinder:
+    image: projectdiscovery/subfinder:latest
+    environment:
+      - XDG_CONFIG_HOME=/data/.config
+    volumes: ["./data:/data"]
+    working_dir: /data
+  amass:
+    image: caffix/amass:latest
+    volumes: ["./data:/data"]
+    working_dir: /data
+  dnsx:
+    image: projectdiscovery/dnsx:latest
+    environment:
+      - XDG_CONFIG_HOME=/data/.config
+    volumes: ["./data:/data"]
+    working_dir: /data
+  naabu:
+    image: projectdiscovery/naabu:latest
+    network_mode: host
+    cap_add: ["NET_RAW","NET_ADMIN"]
+    volumes: ["./data:/data"]
+    working_dir: /data
+  nmap:
+    image: instrumentisto/nmap:latest
+    network_mode: host
+    cap_add: ["NET_RAW","NET_ADMIN"]
+    volumes: ["./data:/data"]
+    working_dir: /data
+  httpx:
+    image: projectdiscovery/httpx:latest
+    environment:
+      - XDG_CONFIG_HOME=/data/.config
+    volumes: ["./data:/data"]
+    working_dir: /data
+  nuclei:
+    image: projectdiscovery/nuclei:latest
+    environment:
+      - XDG_CONFIG_HOME=/data/.config
+      - NUCLEI_TEMPLATES_DIRECTORY=/data/.cache/nuclei-templates
+    volumes: ["./data:/data"]
+    working_dir: /data
+  katana:
+    image: projectdiscovery/katana:latest
+    volumes: ["./data:/data"]
+    working_dir: /data
+    user: "1000:1000"
+  testssl:
+    image: drwetter/testssl.sh:latest
+    volumes: ["./data:/data"]
+    working_dir: /data
+  sslyze:
+    image: nablac0d3/sslyze:latest
+    volumes: ["./data:/data"]
+    working_dir: /data
+  gowitness:
+    image: strip/gowitness:arm64
+    build:
+      context: ./images/gowitness
+      # platforms is optional here on ARM since you’re building locally
+      # platforms: ["linux/arm64"]
+    pull_policy: never
+    volumes: ["./data:/data"]
+    working_dir: /data
+  prowler:
+    image: prowlercloud/prowler:latest
+    platform: linux/amd64
+    environment:
+      - AWS_SHARED_CREDENTIALS_FILE=/creds/aws/credentials
+      - AWS_CONFIG_FILE=/creds/aws/config
+    volumes:
+      - ./data:/data
+      - ./data/creds:/creds:ro
+    working_dir: /data
+  scoutsuite:
+    image: opendevsecops/scoutsuite:latest
+    platform: linux/amd64
+    volumes:
+      - ./data:/data
+      - ./data/creds:/root/.config:ro
+    working_dir: /data  
