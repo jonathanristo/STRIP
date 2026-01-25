@@ -37,6 +37,9 @@ domains.txt → subdomain discovery → DNS resolution → port scanning
 - `yq` (YAML processor) - [Installation guide](https://github.com/mikefarah/yq)
 - `jq` (JSON processor) - Usually pre-installed on Linux/macOS
 
+**Note for Apple Silicon Users (M1/M2/M3):** For optimal performance, see [Apple Silicon Setup](#apple-silicon-setup) below.
+
+
 ### Installation
 
 ```bash
@@ -56,7 +59,26 @@ EOF
 # Run your first scan
 ./stripctl run daily
 ```
+---
 
+**For Apple Silicon Macs (M1/M2/M3/M4), you can optionally use an ARM-optimized gowitness build for better performance:**
+```bash
+# Enable ARM64-optimized gowitness
+cp docker-compose.override.yml.example docker-compose.override.yml
+
+# Build the custom image
+docker compose build gowitness
+```
+
+**Intel Macs, Windows, and Linux users:** No action needed - the default configuration works out of the box.
+
+<details>
+<summary>Why is this needed?</summary>
+
+The official gowitness image is AMD64 (x86_64). It works on Apple Silicon via emulation, but building a native ARM64 version provides better performance for screenshot capture on Apple Silicon Macs.
+</details>
+
+---
 ### First Run
 ```bash
 # Daily scan (High/Critical findings only)
@@ -407,7 +429,14 @@ brew install yq
 wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
 chmod +x /usr/local/bin/yq
 ```
+### Gowitness is slow on Apple Silicon
 
+If screenshot capture is slow on M1/M2/M3 Macs:
+```bash
+# Use ARM-optimized build
+cp docker-compose.override.yml.example docker-compose.override.yml
+docker compose build gowitness
+docker compose up -d gowitness
 ---
 
 ## Roadmap
