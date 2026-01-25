@@ -480,11 +480,11 @@ And the entire open-source security community.
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/strip/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/strip/discussions)
-- **Documentation**: [Wiki](https://github.com/yourusername/strip/wiki)
+- **Issues**: [GitHub Issues](https://github.com/jonathanristo/strip/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/jonathanristo/strip/discussions)
+- **Documentation**: [Wiki](https://github.com/jonathanristo/strip/wiki)
 
 ---
 
-**Built with ❤️ for the security community**
+**Built for the security community**
 
