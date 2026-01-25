@@ -437,6 +437,7 @@ If screenshot capture is slow on M1/M2/M3 Macs:
 cp docker-compose.override.yml.example docker-compose.override.yml
 docker compose build gowitness
 docker compose up -d gowitness
+```
 ---
 
 ## Roadmap
