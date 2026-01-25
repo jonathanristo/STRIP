@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STRIP_HOME="/opt/strip"
+CFG="$STRIP_HOME/strip.yaml"
+OUTROOT="$(yq -r '.output.root' "$CFG")"
+TS="$(date +%Y%m%d-%H%M%S)"
+OUT="$STRIP_HOME/${OUTROOT#./}/$TS"
+mkdir -p "$OUT"
+
+compose(){ docker compose -f "$STRIP_HOME/docker-compose.yml" "$@"; }
+yqg(){ yq -r "$1" "$CFG"; }
+log(){ echo "[STRIP $(date +%H:%M:%S)] $*"; }
+need(){ [[ -f "$1" ]] || { echo "Missing $1"; exit 1; }; }
+
+discover(){
+  local domains="$STRIP_HOME/$(yqg '.inputs.domains_file' | sed 's#^\./##')"
+  local resolv="$STRIP_HOME/$(yqg '.inputs.resolvers_file' | sed 's#^\./##')"
+  need "$domains"
+  log "Output → $OUT"
+  cp "$domains" "$OUT/domains.txt"
+
+  log "subfinder…"
+  compose run --rm subfinder -dL "/data/out/$TS/domains.txt" -all -silent -o "/data/out/$TS/subs.subfinder.txt"
+  sort -u "$OUT"/subs.*.txt > "$OUT/subs.txt" || cp "$OUT/subs.subfinder.txt" "$OUT/subs.txt"
+
+if [[ -f "$resolv" ]]; then
+  log "dnsx (custom resolvers)…"
+  resopts=()
+  while read -r r; do
+    [[ -n "$r" && "$r" != \#* ]] && resopts+=(-r "$r")
+  done < "$resolv"
+  compose run --rm dnsx -l "/data/out/$TS/subs.txt" "${resopts[@]}" -a -o "/data/out/$TS/resolved.txt"
+else
+  log "dnsx…"
+  compose run --rm dnsx -l "/data/out/$TS/subs.txt" -a -o "/data/out/$TS/resolved.txt"
+fi
+  cut -d' ' -f1 "$OUT/resolved.txt" | sort -u > "$OUT/hosts_resolved.txt"
+
+  log "naabu ports (top)…"
+  compose run --rm naabu -list "/data/out/$TS/hosts_resolved.txt" -top-ports "$(yqg '.scan.naabu.top_ports')" --rate "$(yqg '.scan.naabu.rate')" -silent -o "/data/out/$TS/ports.naabu.txt"
+
+  log "nmap follow-up (light -sV)…"
+  awk -F: '{print $1}' "$OUT/ports.naabu.txt" | sort -u > "$OUT/hosts_for_nmap.txt"
+  [[ -s "$OUT/hosts_for_nmap.txt" ]] && compose run --rm nmap nmap -sV --version-light -T3 -iL "/data/out/$TS/hosts_for_nmap.txt" --top-ports 20 -oX "/data/out/$TS/nmap.xml" || true
+
+  log "httpx (title/tech)…"
+  awk -F: '{print "http://"$1; print "https://"$1}' "$OUT/ports.naabu.txt" | sort -u > "$OUT/urls.txt"
+compose run --rm httpx \
+  -l "/data/out/$TS/urls.txt" \
+  -json \
+  -silent \
+  -status-code \
+  -title \
+  -tech-detect \
+  -o "/data/out/$TS/httpx.json"
+
+  log "[✓] STRIP discovery complete."
+}
+
+weekly() {
+ local domains="$STRIP_HOME/$(yqg '.inputs.domains_file' | sed 's#^\./##')"
+  local resolv="$STRIP_HOME/$(yqg '.inputs.resolvers_file' | sed 's#^\./##')"
+  need "$domains"
+  log "Output → $OUT"
+  cp "$domains" "$OUT/domains.txt"
+
+  log "amass (passive)…"
+  compose run --rm amass enum -norecursive -passive -df "/data/out/$TS/domains.txt" -o "/data/out/$TS/subs.amass.txt" || true
+  sort -u "$OUT"/subs.*.txt > "$OUT/subs.txt" || cp "$OUT/subs.subfinder.txt" "$OUT/subs.txt"
+    log "testssl…"
+    compose run --rm testssl --file "/data/out/$TS/urls.txt" --jsonfile "/data/out/$TS/testssl.json" || true
+      log "[✓] STRIP weekly discovery complete."
+}	
+webscan(){
+  local sev="${1:-$(yqg '.scan.nuclei.severity_daily')}"
+  log "nuclei HTTP (severity: $sev)…"
+  compose run --rm nuclei -stats -rl "$(yqg '.scan.nuclei.rate_limit')" -c "$(yqg '.scan.nuclei.concurrency')" \
+    -severity "$sev" -ni -duc -jsonl -l "/data/out/$TS/urls.txt" -o "/data/out/$TS/nuclei.jsonl" || true
+
+  if [[ "$(yqg '.scan.tls.sslyze')" == "true" ]]; then
+    log "sslyze…"
+    compose run --rm sslyze --json_out "/data/out/$TS/sslyze.json" --targets_in "/data/out/$TS/urls.txt" || true
+  fi
+  log "[✓] Web/TLS done."
+}
+
+shots(){
+  [[ "$(yqg '.screenshots.enable')" == "true" ]] || { log "screenshots disabled"; return 0; }
+  log "gowitness screenshots…"
+
+  # Ensure we have a urls.txt for this TS; if not (when running shots alone),
+  # fall back to the most recent run directory that has urls.txt
+  if [[ ! -f "/opt/strip/data/out/$TS/urls.txt" ]]; then
+    local LATEST
+    LATEST="$(ls -1t /opt/strip/data/out | head -1 2>/dev/null || true)"
+    if [[ -n "$LATEST" && -f "/opt/strip/data/out/$LATEST/urls.txt" ]]; then
+      log "urls.txt not found for $TS; using latest run: $LATEST"
+      TS="$LATEST"
+      R="/opt/strip/data/out/$TS"
+    else
+      log "no urls.txt available; run daily/weekly first"
+      return 0
+    fi
+  fi
+
+  # Keep only http/https
+  grep -E '^(https?://)' "/opt/strip/data/out/$TS/urls.txt" > "/opt/strip/data/out/$TS/urls.http.txt" || true
+  mv "/opt/strip/data/out/$TS/urls.http.txt" "/opt/strip/data/out/$TS/urls.txt"
+
+  # Ensure screenshots dir
+  mkdir -p "/opt/strip/data/out/$TS/screens"
+
+  # gowitness v3: scan from file, save screenshots, DB, and JSONL
+  compose run --rm gowitness scan file \
+    -f "/data/out/$TS/urls.txt" \
+    --screenshot-path "/data/out/$TS/screens" \
+    --write-db \
+    --write-db-uri "sqlite:///data/out/$TS/gowitness.sqlite3" \
+    --write-jsonl \
+    --write-jsonl-file "/data/out/$TS/gowitness.jsonl" \
+    -t "$(yqg '.screenshots.gowitness.workers')" \
+    -T 10 || true
+
+  # Optional HTML report (v3): generate a zip from the sqlite DB + screenshots
+  compose run --rm gowitness report generate \
+    --db-uri "sqlite:///data/out/$TS/gowitness.sqlite3" \
+    --screenshot-path "/data/out/$TS/screens" \
+    --zip-name "/data/out/$TS/gowitness-report.zip" || true
+
+  log "[✓] Gowitness done."
+}
+
+cloud(){
+  [[ "$(yqg '.cloud.enable')" == "true" ]] || { log "cloud disabled"; return 0; }
+  mkdir -p "$OUT/cloud/prowler" "$OUT/cloud/scoutsuite"
+
+  if [[ -f "$STRIP_HOME/data/creds/aws/credentials" ]] || [[ -n "${AWS_ROLE_ARN:-}" ]]; then
+    log "prowler (AWS)…"
+    compose run --rm prowler aws -M json,csv -o "/data/out/$TS/cloud/prowler/aws"
+    log "ScoutSuite (AWS)…"
+    compose run --rm scoutsuite scout aws --report-dir "/data/out/$TS/cloud/scoutsuite/aws" || true
+  fi
+  local az_env="$STRIP_HOME/$(yqg '.cloud.azure_env_file' | sed 's#^\./##')"
+  if [[ -f "$az_env" ]]; then
+    set -a; source "$az_env"; set +a
+    log "prowler (Azure)…"
+    compose run --rm prowler azure -M json,csv -o "/data/out/$TS/cloud/prowler/azure" || true
+    log "ScoutSuite (Azure)…"
+    compose run --rm scoutsuite scout azure --report-dir "/data/out/$TS/cloud/scoutsuite/azure" || true
+  fi
+  local gcp_key="$STRIP_HOME/$(yqg '.cloud.gcp_key_file' | sed 's#^\./##')"
+  if [[ -f "$gcp_key" ]]; then
+    log "prowler (GCP)…"
+    compose run --rm prowler gcp -M json,csv -o "/data/out/$TS/cloud/prowler/gcp" || true
+    log "ScoutSuite (GCP)…"
+    compose run --rm scoutsuite scout gcp --report-dir "/data/out/$TS/cloud/scoutsuite/gcp" || true
+  fi
+  log "[✓] Cloud checks done."
+}
+
+merge(){
+  local R="$OUT"
+  log "Merging outputs…"
+[[ -s "$R/httpx.json" ]] && \
+jq -c '
+  {
+    fqdn: (.url // ""),
+    host: (.host // ""),
+    ip:   (.input // .ip // ""),
+    status: (.status_code // 0),
+    title:  (.title // ""),
+    tech:
+      (
+        (.tech // .technologies // "") |
+        if type=="string" then
+          (if . == "" then [] else (split(",") | map(ascii_downcase)) end)
+        elif type=="array" then
+          (map(tostring | ascii_downcase))
+        else
+          []
+        end
+      ),
+    observed_at:"'"$TS"'",
+    source:"httpx"
+  }' "$R/httpx.json" > "$R/web_assets.ndjson" || true
+
+  if [[ -f "$R/ports.naabu.txt" ]]; then
+    awk -F: '{printf("{\"host\":\"%s\",\"port\":%d,\"source\":\"naabu\",\"observed_at\":\"%s\"}\n",$1,$2,"'"$TS"'");}' "$R/ports.naabu.txt" > "$R/services.ndjson"
+  fi
+  if [[ -f "$R/nmap.xml" ]]; then
+    xmlstarlet sel -t -m "//host/ports/port[state/@state='open']" \
+      -v "concat(../../address[@addrtype='ipv4']/@addr,'|',@portid,'|',service/@name,'|',service/@product,'|',service/@version)" -n "$R/nmap.xml" \
+    | awk -F'|' '{printf("{\"ip\":\"%s\",\"port\":%d,\"service\":\"%s\",\"product\":\"%s\",\"version\":\"%s\",\"source\":\"nmap\",\"observed_at\":\"%s\"}\n",$1,$2,$3,$4,$5,"'"$TS"'");}' \
+    >> "$R/services.ndjson"
+  fi
+
+  { [[ -s "$R/nuclei.jsonl" ]] && jq -c -R 'fromjson? | select(.)' "$R/nuclei.jsonl"; } \
+| jq -c '{host:(.host//.ip),
+          url:.url,
+          template:(.templateID),
+          severity:(.severity|ascii_downcase),
+          name:(.info.name),
+          evidence:(.matcher_name // .["matcher-status"]),
+          source:"nuclei",
+          observed_at:"'"$TS"'",
+          raw:.}' \
+> "$R/findings.ndjson" 2>/dev/null || true
+[[ -s "$R/testssl.json" ]] && \
+jq -c -R 'fromjson? | select(.)' "$R/testssl.json" \
+| jq -c '
+  def flat: if type=="array" then .[] else . end;
+  flat | ( .scanResult // . ) | flat
+  | { ip: (.ip // .server // .target // .host // .fqdn // .hostname),
+      finding: (.finding // .id),
+      severity: (.severity // "info"),
+      source: "testssl",
+      observed_at: "'"$TS"'",
+      raw: .
+    }
+' >> "$R/findings.ndjson" || true
+
+  [[ -s "$R/web_assets.ndjson" ]] && jq -r '[.fqdn,.host,.ip,.status,.title]|@csv' "$R/web_assets.ndjson" > "$R/web_assets.csv" || true
+  [[ -s "$R/services.ndjson"   ]] && jq -r '[.host//.ip,.port,.service//"",.product//"",.version//"",.title//""]|@csv' "$R/services.ndjson" > "$R/open_ports.csv" || true
+  [[ -s "$R/findings.ndjson"   ]] && jq -r '[.host//.ip,.url//"",.severity,.template//.finding,.source]|@csv' "$R/findings.ndjson" > "$R/findings_summary.csv" || true
+  # Ensure findings.ndjson has at least one line, so we know merge worked
+  if [[ ! -s "$R/findings.ndjson" ]]; then
+    echo "{\"message\":\"No findings from this run\",\"observed_at\":\"$TS\"}" > "$R/findings.ndjson"
+  fi
+
+  log "[✓] Merge complete → $R"
+}
+
+usage(){
+  cat <<USAGE
+STRIP — Surface Threat Reconnaissance & Identification Platform
+
+Usage:
+  stripctl discover           # domains → subs → resolve → ports → httpx
+  stripctl web-scan [SEV]     # nuclei (HTTP) + TLS (testssl/sslyze)
+  stripctl shots              # screenshots (gowitness)
+  stripctl cloud              # prowler + scoutsuite (if enabled)
+  stripctl run daily          # discover + web-scan (high,critical) + shots + merge
+  stripctl run weekly         # discover + web-scan (medium,high,critical) + shots + (optional katana) + merge
+  stripctl merge              # normalize outputs into CSV/NDJSON
+USAGE
+}
+
+case "${1:-}" in
+  discover) discover ;;
+  web-scan) webscan "${2:-}" ;;
+  shots)    shots ;;
+  cloud)    cloud ;;
+  run)
+    case "${2:-}" in
+      daily)  discover; webscan "$(yqg '.scan.nuclei.severity_daily')"; shots; cloud; merge ;;
+      weekly) discover; webscan "$(yqg '.scan.nuclei.severity_weekly')"; shots; cloud; merge ;;
+      *) usage ;;
+    esac ;;
+  merge) merge ;;
+  *) usage ;;
+esac

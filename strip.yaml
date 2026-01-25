@@ -1,0 +1,39 @@
+brand: "STRIP"   # Surface Threat Reconnaissance & Identification Platform
+
+inputs:
+  domains_file: "./data/in/domains.txt"
+  resolvers_file: "./data/in/resolvers.txt"  # optional
+
+scan:
+  naabu:
+    top_ports: "1000"
+    rate: 5000
+  httpx:
+    rate_limit: 400
+  nuclei:
+    severity_daily: "high,critical"
+    severity_weekly: "medium,high,critical"
+    rate_limit: 200
+    concurrency: 50
+  katana:
+    enable: false
+    depth: 2
+    js_crawl: true
+  tls:
+    testssl: true
+    sslyze: false
+
+cloud:
+  enable: true
+  aws_profiles: "default"
+  azure_env_file: "./data/creds/azure/.env"
+  gcp_key_file: "./data/creds/gcp/key.json"
+
+screenshots:
+  enable: true
+  gowitness:
+    workers: 10
+    delay: 0
+
+output:
+  root: "./data/out"
