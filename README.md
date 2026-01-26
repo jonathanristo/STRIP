@@ -24,7 +24,6 @@ domains.txt → subdomain discovery → DNS resolution → port scanning
 - 🌍 HTTP/HTTPS service profiling
 - 🎯 Template-based vulnerability scanning
 - 🔒 TLS/SSL configuration assessment
-- 📸 Visual reconnaissance (screenshots)
 - ☁️ Cloud security posture assessment (AWS/Azure/GCP)
 - 📊 Structured outputs (JSON, CSV)
 
@@ -123,9 +122,6 @@ scan:
     severity_daily: "high,critical"
     severity_weekly: "medium,high,critical"
 
-screenshots:
-  enable: true           # Set to false to skip screenshots
-  
 cloud:
   enable: false          # Enable for AWS/Azure/GCP scanning
 ```
@@ -144,10 +140,6 @@ data/out/20260125-143022/
 ├── httpx.json               # HTTP service details
 ├── nuclei.jsonl             # Vulnerability findings
 ├── testssl.json             # TLS/SSL assessment (weekly)
-├── gowitness.sqlite3        # Screenshot database
-├── screens/                 # Screenshot images
-├── gowitness-report.zip     # HTML report
-│
 ├── web_assets.ndjson        # Normalized web assets
 ├── web_assets.csv           # CSV export
 ├── findings.ndjson          # Normalized vulnerability findings
@@ -170,8 +162,7 @@ STRIP leverages best-in-class open-source security tools:
 | | [httpx](https://github.com/projectdiscovery/httpx) | HTTP probing & tech detection |
 | **Assessment** | [nuclei](https://github.com/projectdiscovery/nuclei) | Vulnerability scanning (templates) |
 | | [testssl.sh](https://testssl.sh/) | TLS/SSL security assessment |
-| **Recon** | [gowitness](https://github.com/sensepost/gowitness) | Screenshot capture & reporting |
-| | [katana](https://github.com/projectdiscovery/katana) | Web crawling (optional) |
+| **Recon** | [katana](https://github.com/projectdiscovery/katana) | Web crawling (optional) |
 | **Cloud** | [prowler](https://github.com/prowler-cloud/prowler) | Cloud security (AWS/Azure/GCP) |
 | | [ScoutSuite](https://github.com/nccgroup/ScoutSuite) | Multi-cloud security auditing |
 
@@ -352,13 +343,13 @@ open_ports.csv          - Port scan results
                     │   (probing)    │
                     └───────┬────────┘
                             │
-                ┌───────────┼───────────┐
-                │           │           │
-        ┌───────▼──┐   ┌────▼────┐  ┌──▼──────┐
-        │  nuclei  │   │testssl  │  │gowitness│
-        └───────┬──┘   └────┬────┘  └──┬──────┘
-                │           │           │
-                └───────────┼───────────┘
+                ┌───────────┼
+                │           │      
+        ┌───────▼──┐   ┌────▼────┐ 
+        │  nuclei  │   │testssl  │ 
+        └───────┬──┘   └────┬────┘ 
+                │           │
+                └───────────┼
                             │
                     ┌───────▼────────┐
                     │     merge      │
@@ -499,7 +490,6 @@ STRIP stands on the shoulders of giants. Huge thanks to:
 - [ProjectDiscovery](https://github.com/projectdiscovery) - subfinder, nuclei, httpx, naabu, dnsx, katana
 - [OWASP Amass](https://github.com/owasp-amass/amass) - Comprehensive subdomain discovery
 - [testssl.sh](https://github.com/drwetter/testssl.sh) - TLS/SSL testing
-- [gowitness](https://github.com/sensepost/gowitness) - Screenshot tool
 - [Prowler](https://github.com/prowler-cloud/prowler) - Cloud security
 - [ScoutSuite](https://github.com/nccgroup/ScoutSuite) - Multi-cloud auditing
 
