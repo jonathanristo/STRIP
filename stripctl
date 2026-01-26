@@ -5,6 +5,7 @@ STRIP_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFG="$STRIP_HOME/strip.yaml"
 OUTROOT="$(yq -r '.output.root' "$CFG")"
 TS="$(date +%Y%m%d-%H%M%S)"
+DATA_DIR="${DATA_DIR:-$(pwd)/data}"
 OUT="$STRIP_HOME/${OUTROOT#./}/$TS"
 mkdir -p "$OUT"
 
@@ -12,6 +13,80 @@ compose(){ docker compose -f "$STRIP_HOME/docker-compose.yml" "$@"; }
 yqg(){ yq -r "$1" "$CFG"; }
 log(){ echo "[STRIP $(date +%H:%M:%S)] $*"; }
 need(){ [[ -f "$1" ]] || { echo "Missing $1"; exit 1; }; }
+
+setup() {
+  echo "═══════════════════════════════════════════════"
+  echo "  STRIP Initial Setup"
+  echo "═══════════════════════════════════════════════"
+  echo ""
+  
+  # Create Docker volume for templates
+  log "Creating Docker volume for Nuclei templates..."
+  docker volume create nuclei-templates 2>/dev/null || true
+  
+  # Create local directories for output
+  log "Creating output directories..."
+  mkdir -p "$DATA_DIR/out"
+  
+  # Download Nuclei templates to Docker volume
+  log "Downloading Nuclei vulnerability templates..."
+  log "This may take 2-5 minutes on first run..."
+  echo ""
+  
+  docker run --rm \
+    -v nuclei-templates:/root/nuclei-templates \
+    projectdiscovery/nuclei:latest \
+    -update-templates
+  
+  # Verify templates were downloaded
+  TEMPLATE_COUNT=$(docker run --rm \
+    -v nuclei-templates:/root/nuclei-templates \
+    alpine:latest \
+    find /root/nuclei-templates -name "*.yaml" 2>/dev/null | wc -l | tr -d ' ')
+  
+  if [ "$TEMPLATE_COUNT" -gt 1000 ]; then
+    echo ""
+    log "✓ Setup complete!"
+    log "Templates installed: $TEMPLATE_COUNT templates"
+    log "Storage: Docker volume 'nuclei-templates' (isolated from host)"
+    echo ""
+    echo "Next steps:"
+    echo "  ./stripctl discover     # Discover targets"
+    echo "  ./stripctl run daily    # Run daily scan"
+    echo ""
+  else
+    echo ""
+    echo "[ERR] Setup failed - only $TEMPLATE_COUNT templates found"
+    echo "Expected 10,000+ templates"
+    exit 1
+  fi
+}
+
+ensure_nuclei_templates() {
+  # Check if Docker volume exists
+  if ! docker volume inspect nuclei-templates >/dev/null 2>&1; then
+    log "⚠ Nuclei templates volume not found"
+    log "Running first-time setup..."
+    echo ""
+    setup
+    return
+  fi
+  
+  # Check if volume has templates
+  TEMPLATE_COUNT=$(docker run --rm \
+    -v nuclei-templates:/root/nuclei-templates \
+    alpine:latest \
+    find /root/nuclei-templates -name "*.yaml" 2>/dev/null | wc -l | tr -d ' ')
+  
+  if [ "$TEMPLATE_COUNT" -lt 1000 ]; then
+    log "⚠ Nuclei templates incomplete ($TEMPLATE_COUNT templates)"
+    log "Running setup to download templates..."
+    echo ""
+    setup
+  else
+    log "✓ Nuclei templates found ($TEMPLATE_COUNT templates)"
+  fi
+}
 
 discover(){
   local domains="$STRIP_HOME/$(yqg '.inputs.domains_file' | sed 's#^\./##')"
@@ -76,7 +151,7 @@ webscan(){
   local sev="${1:-$(yqg '.scan.nuclei.severity_daily')}"
   log "nuclei HTTP (severity: $sev)…"
   compose run --rm nuclei -stats -rl "$(yqg '.scan.nuclei.rate_limit')" -c "$(yqg '.scan.nuclei.concurrency')" \
-    -severity "$sev" -ni -duc -jsonl -l "/data/out/$TS/urls.txt" -o "/data/out/$TS/nuclei.jsonl" || true
+    -severity "$sev" -ni -jsonl -l "/data/out/$TS/urls.txt" -o "/data/out/$TS/nuclei.jsonl" || true
 
   if [[ "$(yqg '.scan.tls.sslyze')" == "true" ]]; then
     log "sslyze…"
@@ -235,28 +310,78 @@ usage(){
   cat <<USAGE
 STRIP — Surface Threat Reconnaissance & Identification Platform
 
-Usage:
-  stripctl discover           # domains → subs → resolve → ports → httpx
-  stripctl web-scan [SEV]     # nuclei (HTTP) + TLS (testssl/sslyze)
-  stripctl shots              # screenshots (gowitness)
-  stripctl cloud              # prowler + scoutsuite (if enabled)
-  stripctl run daily          # discover + web-scan (high,critical) + shots + merge
-  stripctl run weekly         # discover + web-scan (medium,high,critical) + shots + (optional katana) + merge
-  stripctl merge              # normalize outputs into CSV/NDJSON
+Setup (first time only):
+  stripctl setup                  # Download Nuclei templates to Docker volume
+
+Discovery & Scanning:
+  stripctl discover               # Full reconnaissance (subdomains → DNS → ports → HTTP)
+  stripctl run daily              # Complete daily scan (discover + nuclei + screenshots)
+  stripctl run weekly             # Comprehensive weekly scan (includes medium severity)
+
+Additional:
+  stripctl cloud                  # Cloud security audit (AWS/Azure/GCP)
+  stripctl merge                  # Consolidate scan results into reports
+
+Examples:
+  # First time setup (optional - auto-runs if templates missing)
+  ./stripctl setup
+
+  # Discover targets
+  ./stripctl discover
+
+  # Daily monitoring scan
+  ./stripctl run daily
+
+  # Weekly comprehensive scan
+  ./stripctl run weekly
+
+Output: data/out/YYYYMMDD-HHMMSS/
+
+Notes:
+  - Templates stored securely in Docker volume (not on host filesystem)
+  - Templates auto-download on first 'run daily' or 'run weekly' if missing
+  - 'discover' can be run standalone for manual analysis
+  - 'run daily/weekly' includes full workflow (discover + scan + screenshots)
 USAGE
 }
 
 case "${1:-}" in
-  discover) discover ;;
-  web-scan) webscan "${2:-}" ;;
-  shots)    shots ;;
-  cloud)    cloud ;;
+  setup) 
+    setup 
+    ;;
+  discover) 
+    discover 
+    ;;
   run)
     case "${2:-}" in
-      daily)  discover; webscan "$(yqg '.scan.nuclei.severity_daily')"; shots; cloud; merge ;;
-      weekly) discover; webscan "$(yqg '.scan.nuclei.severity_weekly')"; shots; cloud; merge ;;
-      *) usage ;;
-    esac ;;
-  merge) merge ;;
-  *) usage ;;
+      daily)  
+        ensure_nuclei_templates
+        discover
+        webscan "$(yqg '.scan.nuclei.severity_daily')"
+        shots
+        cloud
+        merge 
+        ;;
+      weekly) 
+        ensure_nuclei_templates
+        discover
+        webscan "$(yqg '.scan.nuclei.severity_weekly')"
+        shots
+        cloud
+        merge 
+        ;;
+      *) 
+        usage 
+        ;;
+    esac 
+    ;;
+  cloud) 
+    cloud 
+    ;;
+  merge) 
+    merge 
+    ;;
+  *) 
+    usage 
+    ;;
 esac
