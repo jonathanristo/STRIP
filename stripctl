@@ -166,13 +166,13 @@ shots(){
 
   # Ensure we have a urls.txt for this TS; if not (when running shots alone),
   # fall back to the most recent run directory that has urls.txt
-  if [[ ! -f "/opt/strip/data/out/$TS/urls.txt" ]]; then
+  if [[ ! -f "$OUT/urls.txt" ]]; then
     local LATEST
-    LATEST="$(ls -1t /opt/strip/data/out | head -1 2>/dev/null || true)"
-    if [[ -n "$LATEST" && -f "/opt/strip/data/out/$LATEST/urls.txt" ]]; then
+    LATEST="$(ls -1t "$(dirname "$OUT")" | head -1 2>/dev/null || true)"
+    if [[ -n "$LATEST" && -f "$(dirname "$OUT")/$LATEST/urls.txt" ]]; then
       log "urls.txt not found for $TS; using latest run: $LATEST"
       TS="$LATEST"
-      R="/opt/strip/data/out/$TS"
+      OUT="$(dirname "$OUT")/$TS"
     else
       log "no urls.txt available; run daily/weekly first"
       return 0
@@ -180,11 +180,11 @@ shots(){
   fi
 
   # Keep only http/https
-  grep -E '^(https?://)' "/opt/strip/data/out/$TS/urls.txt" > "/opt/strip/data/out/$TS/urls.http.txt" || true
-  mv "/opt/strip/data/out/$TS/urls.http.txt" "/opt/strip/data/out/$TS/urls.txt"
+  grep -E '^(https?://)' "$OUT/urls.txt" > "$OUT/urls.http.txt" || true
+  mv "$OUT/urls.http.txt" "$OUT/urls.txt"
 
   # Ensure screenshots dir
-  mkdir -p "/opt/strip/data/out/$TS/screens"
+  mkdir -p "$OUT/screens"
 
   # gowitness v3: scan from file, save screenshots, DB, and JSONL
   compose run --rm gowitness scan file \
@@ -205,7 +205,6 @@ shots(){
 
   log "[✓] Gowitness done."
 }
-
 cloud(){
   [[ "$(yqg '.cloud.enable')" == "true" ]] || { log "cloud disabled"; return 0; }
   mkdir -p "$OUT/cloud/prowler" "$OUT/cloud/scoutsuite"
