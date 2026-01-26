@@ -66,11 +66,6 @@ services:
     volumes: ["./data:/data"]
     working_dir: /data
   
-  gowitness:
-    image: leonjza/gowitness:latest
-    volumes: ["./data:/data"]
-    working_dir: /data
-  
   prowler:
     image: prowlercloud/prowler:latest
     platform: linux/amd64
