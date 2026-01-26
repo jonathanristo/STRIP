@@ -160,51 +160,6 @@ webscan(){
   log "[✓] Web/TLS done."
 }
 
-shots(){
-  [[ "$(yqg '.screenshots.enable')" == "true" ]] || { log "screenshots disabled"; return 0; }
-  log "gowitness screenshots…"
-
-  # Ensure we have a urls.txt for this TS; if not (when running shots alone),
-  # fall back to the most recent run directory that has urls.txt
-  if [[ ! -f "$OUT/urls.txt" ]]; then
-    local LATEST
-    LATEST="$(ls -1t "$(dirname "$OUT")" | head -1 2>/dev/null || true)"
-    if [[ -n "$LATEST" && -f "$(dirname "$OUT")/$LATEST/urls.txt" ]]; then
-      log "urls.txt not found for $TS; using latest run: $LATEST"
-      TS="$LATEST"
-      OUT="$(dirname "$OUT")/$TS"
-    else
-      log "no urls.txt available; run daily/weekly first"
-      return 0
-    fi
-  fi
-
-  # Keep only http/https
-  grep -E '^(https?://)' "$OUT/urls.txt" > "$OUT/urls.http.txt" || true
-  mv "$OUT/urls.http.txt" "$OUT/urls.txt"
-
-  # Ensure screenshots dir
-  mkdir -p "$OUT/screens"
-
-  # gowitness v3: scan from file, save screenshots, DB, and JSONL
-  compose run --rm gowitness scan file \
-    -f "/data/out/$TS/urls.txt" \
-    --screenshot-path "/data/out/$TS/screens" \
-    --write-db \
-    --write-db-uri "sqlite:///data/out/$TS/gowitness.sqlite3" \
-    --write-jsonl \
-    --write-jsonl-file "/data/out/$TS/gowitness.jsonl" \
-    -t "$(yqg '.screenshots.gowitness.workers')" \
-    -T 10 || true
-
-  # Optional HTML report (v3): generate a zip from the sqlite DB + screenshots
-  compose run --rm gowitness report generate \
-    --db-uri "sqlite:///data/out/$TS/gowitness.sqlite3" \
-    --screenshot-path "/data/out/$TS/screens" \
-    --zip-name "/data/out/$TS/gowitness-report.zip" || true
-
-  log "[✓] Gowitness done."
-}
 cloud(){
   [[ "$(yqg '.cloud.enable')" == "true" ]] || { log "cloud disabled"; return 0; }
   mkdir -p "$OUT/cloud/prowler" "$OUT/cloud/scoutsuite"
@@ -357,7 +312,6 @@ case "${1:-}" in
         ensure_nuclei_templates
         discover
         webscan "$(yqg '.scan.nuclei.severity_daily')"
-        shots
         cloud
         merge 
         ;;
@@ -365,7 +319,6 @@ case "${1:-}" in
         ensure_nuclei_templates
         discover
         webscan "$(yqg '.scan.nuclei.severity_weekly')"
-        shots
         cloud
         merge 
         ;;
