@@ -104,9 +104,8 @@ That's it. STRIP works out of the box.
 ./stripctl run weekly
 
 # Individual phases
+./stripctl setup                 # initial setup of nuceli (automatically checked with nuceli runs)
 ./stripctl discover              # Subdomain discovery + port scanning
-./stripctl web-scan              # Vulnerability scanning
-./stripctl shots                 # Screenshots only
 ./stripctl cloud                 # Cloud security assessment
 ./stripctl merge                 # Normalize outputs to CSV/JSON
 ```
