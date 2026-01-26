@@ -67,7 +67,7 @@ services:
     working_dir: /data
   
   gowitness:
-    image: sensepost/gowitness:latest
+    image: leonjza/gowitness:latest
     volumes: ["./data:/data"]
     working_dir: /data
   
