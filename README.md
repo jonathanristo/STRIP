@@ -60,22 +60,7 @@ EOF
 ```
 ---
 
-**For Apple Silicon Macs (M1/M2/M3/M4), you can optionally use an ARM-optimized gowitness build for better performance:**
-```bash
-# Enable ARM64-optimized gowitness
-cp docker-compose.override.yml.example docker-compose.override.yml
-
-# Build the custom image
-docker compose build gowitness
-```
-
 **Intel Macs, Windows, and Linux users:** No action needed - the default configuration works out of the box.
-
-<details>
-<summary>Why is this needed?</summary>
-
-The official gowitness image is AMD64 (x86_64). It works on Apple Silicon via emulation, but building a native ARM64 version provides better performance for screenshot capture on Apple Silicon Macs.
-</details>
 
 ---
 ### First Run
