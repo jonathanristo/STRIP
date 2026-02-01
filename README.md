@@ -6,7 +6,7 @@ A lightweight, containerized security reconnaissance platform for automated exte
 
 ---
 
-This project exists to demonstrate what disciplined, repeatable discovery looks like when treated as a system rather than a collection of tools. It is intentionally opinionated, intentionally incomplete, and intentionally boring.
+This project exists to demonstrate what disciplined, repeatable discovery looks like when treated as a system rather than a collection of tools. It is intentionally opinionated, intentionally incomplete by design, and intentionally boring.
 
 ---
 
