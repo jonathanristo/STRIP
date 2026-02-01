@@ -14,7 +14,7 @@ STRIP automates the discovery and assessment of internet-facing assets through a
 
 ```
 domains.txt → subdomain discovery → DNS resolution → port scanning 
-            → web probing → vulnerability scanning → screenshots → reports
+            → web probing → vulnerability scanning → reports
 ```
 
 **Key Capabilities:**
