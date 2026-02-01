@@ -6,6 +6,10 @@ A lightweight, containerized security reconnaissance platform for automated exte
 
 ---
 
+This project exists to demonstrate what disciplined, repeatable discovery looks like when treated as a system rather than a collection of tools. It is intentionally opinionated, intentionally incomplete, and intentionally boring.
+
+---
+
 ## Overview
 
 STRIP automates the discovery and assessment of internet-facing assets through a coordinated pipeline of industry-standard open-source security tools. It's designed for security teams, penetration testers, and bug bounty hunters who need fast, reliable visibility into external attack surfaces.
