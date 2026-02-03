@@ -151,7 +151,7 @@ STRIP leverages best-in-class open-source security tools:
 | | [httpx](https://github.com/projectdiscovery/httpx) | HTTP probing & tech detection |
 | **Assessment** | [nuclei](https://github.com/projectdiscovery/nuclei) | Vulnerability scanning (templates) |
 | | [testssl.sh](https://testssl.sh/) | TLS/SSL security assessment |
-| **Recon** | [katana](https://github.com/projectdiscovery/katana) | Web crawling (optional) |
+| **Recon** | [katana](https://github.com/projectdiscovery/katana) | Web crawling (future plan) |
 | **Cloud** | [prowler](https://github.com/prowler-cloud/prowler) | Cloud security (AWS/Azure/GCP) |
 | | [ScoutSuite](https://github.com/nccgroup/ScoutSuite) | Multi-cloud security auditing |
 
