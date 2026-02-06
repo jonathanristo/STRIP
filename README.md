@@ -507,10 +507,4 @@ And the entire open-source security community.
 ---
 
 **Built for the security community**
-```
-
-
----
-
-**Built for the security community**
 
