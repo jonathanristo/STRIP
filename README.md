@@ -9,7 +9,15 @@ A lightweight, containerized security reconnaissance platform for automated exte
 This project exists to demonstrate what disciplined, repeatable discovery looks like when treated as a system rather than a collection of tools. It is intentionally opinionated, intentionally incomplete by design, and intentionally boring.
 
 ---
+## Project Background
 
+STRIP is an open-source reconnaissance platform developed by [Jonathan Risto](https://www.linkedin.com/in/jonathanristo) as part of security research at [ZenzizenSec Inc.](https://zenzizensec.com)
+
+**Related frameworks:** [VMMM v2](https://zenzizensec.com/vmmm) | [CTEMMM](https://zenzizensec.com/ctemmm)
+
+This project provides practical tooling that complements vulnerability and exposure management maturity assessment frameworks.
+
+---
 ## Overview
 
 STRIP automates the discovery and assessment of internet-facing assets through a coordinated pipeline of industry-standard open-source security tools. It's designed for security teams, penetration testers, and bug bounty hunters who need fast, reliable visibility into external attack surfaces.
@@ -488,9 +496,19 @@ And the entire open-source security community.
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/jonathanristo/strip/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/jonathanristo/strip/discussions)
-- **Documentation**: [Wiki](https://github.com/jonathanristo/strip/wiki)
+* **Issues**: [GitHub Issues](https://github.com/jonathanristo/strip/issues)
+* **Discussions**: [GitHub Discussions](https://github.com/jonathanristo/strip/discussions)
+* **Documentation**: [Wiki](https://github.com/jonathanristo/strip/wiki)
+
+---
+
+**Maintained by:** [Jonathan Risto](https://www.linkedin.com/in/jonathanristo) | [ZenzizenSec Inc.](https://zenzizensec.com)
+
+---
+
+**Built for the security community**
+```
+
 
 ---
 
