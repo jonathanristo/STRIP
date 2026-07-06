@@ -65,22 +65,15 @@ services:
     image: nablac0d3/sslyze:latest
     volumes: ["./data:/data"]
     working_dir: /data
-  
-  prowler:
-    image: prowlercloud/prowler:latest
-    platform: linux/amd64
-    environment:
-      - AWS_SHARED_CREDENTIALS_FILE=/creds/aws/credentials
-      - AWS_CONFIG_FILE=/creds/aws/config
-    volumes:
-      - ./data:/data
-      - ./data/creds:/creds:ro
+
+  gowitness:
+    image: ghcr.io/sensepost/gowitness:latest
+    platform: linux/amd64   # image is amd64-only: native on amd64 Linux/Windows, emulated on arm64
+    volumes: ["./data:/data"]
     working_dir: /data
-  
-  scoutsuite:
-    image: opendevsecops/scoutsuite:latest
-    platform: linux/amd64
-    volumes:
-      - ./data:/data
-      - ./data/creds:/root/.config:ro
+
+  # merge-phase helper: parses nmap.xml (stdlib XML, no host dependency) to keep product/version separate
+  xmlparse:
+    image: python:3-alpine
+    volumes: ["./data:/data"]
     working_dir: /data

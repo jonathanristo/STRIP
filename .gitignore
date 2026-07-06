@@ -97,6 +97,9 @@ yarn-error.log*
 .AppleDouble
 .LSOverride
 
+project doc plans
+UNCOVER_docs/
+
 # Linux
 *~
 .fuse_hidden*

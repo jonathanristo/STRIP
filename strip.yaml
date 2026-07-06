@@ -16,18 +16,12 @@ scan:
     rate_limit: 200
     concurrency: 50
   katana:
-    enable: false
+    enable: true       # crawls in the weekly sweep only (daily never crawls)
     depth: 2
     js_crawl: true
   tls:
     testssl: true
     sslyze: false
-
-cloud:
-  enable: true
-  aws_profiles: "default"
-  azure_env_file: "./data/creds/azure/.env"
-  gcp_key_file: "./data/creds/gcp/key.json"
 
 screenshots:
   enable: true

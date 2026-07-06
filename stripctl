@@ -2,9 +2,15 @@
 set -euo pipefail
 
 STRIP_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STRIP_VERSION="$(cat "$STRIP_HOME/VERSION" 2>/dev/null || echo unknown)"
+# version is answerable without yq/docker/config, so short-circuit early
+[[ "${1:-}" == "version" || "${1:-}" == "--version" || "${1:-}" == "-v" ]] && { echo "STRIP v$STRIP_VERSION"; exit 0; }
 CFG="$STRIP_HOME/strip.yaml"
 OUTROOT="$(yq -r '.output.root' "$CFG")"
-TS="$(date +%Y%m%d-%H%M%S)"
+SCAN_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"   # ISO 8601 UTC — record timestamp / scan_id (TR-004)
+# run-dir keeps the original YYYYMMDD-HHMMSS format (UTC, derived from SCAN_TS) so nothing parsing
+# directory names breaks — TR-004 only requires ISO 8601 on the record fields, not the dir.
+TS="$(d=${SCAN_TS%%T*}; t=${SCAN_TS#*T}; t=${t%Z}; echo "${d//-/}-${t//:/}")"
 DATA_DIR="${DATA_DIR:-$(pwd)/data}"
 OUT="$STRIP_HOME/${OUTROOT#./}/$TS"
 mkdir -p "$OUT"
@@ -95,58 +101,87 @@ discover(){
   log "Output → $OUT"
   cp "$domains" "$OUT/domains.txt"
 
-  log "subfinder…"
-  compose run --rm subfinder -dL "/data/out/$TS/domains.txt" -all -silent -o "/data/out/$TS/subs.subfinder.txt"
-  sort -u "$OUT"/subs.*.txt > "$OUT/subs.txt" || cp "$OUT/subs.subfinder.txt" "$OUT/subs.txt"
+  # ── Classify inputs: domain | IP | CIDR ───────────────────────────────────
+  : > "$OUT/in_domains.txt"; : > "$OUT/in_ips.txt"; : > "$OUT/in_cidrs.txt"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"; line="${line//[[:space:]]/}"
+    [[ -z "$line" ]] && continue
+    if   [[ "$line" == */* ]]; then printf '%s\n' "$line" >> "$OUT/in_cidrs.txt"     # IPv4/IPv6 CIDR
+    elif [[ "$line" == *:* ]]; then printf '%s\n' "$line" >> "$OUT/in_ips.txt"       # IPv6 literal
+    elif [[ "$line" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then printf '%s\n' "$line" >> "$OUT/in_ips.txt"  # IPv4
+    else printf '%s\n' "$line" >> "$OUT/in_domains.txt"                              # domain
+    fi
+  done < "$OUT/domains.txt"
+  log "inputs → domains:$(wc -l <"$OUT/in_domains.txt"|tr -d ' ') ips:$(wc -l <"$OUT/in_ips.txt"|tr -d ' ') cidrs:$(wc -l <"$OUT/in_cidrs.txt"|tr -d ' ')"
 
-if [[ -f "$resolv" ]]; then
-  log "dnsx (custom resolvers)…"
-  resopts=()
-  while read -r r; do
-    [[ -n "$r" && "$r" != \#* ]] && resopts+=(-r "$r")
-  done < "$resolv"
-  compose run --rm dnsx -l "/data/out/$TS/subs.txt" "${resopts[@]}" -a -o "/data/out/$TS/resolved.txt"
-else
-  log "dnsx…"
-  compose run --rm dnsx -l "/data/out/$TS/subs.txt" -a -o "/data/out/$TS/resolved.txt"
-fi
-  cut -d' ' -f1 "$OUT/resolved.txt" | sort -u > "$OUT/hosts_resolved.txt"
+  # ── Subdomain discovery + DNS resolution (domains only) ───────────────────
+  : > "$OUT/hosts_resolved.txt"
+  if [[ -s "$OUT/in_domains.txt" ]]; then
+    log "subfinder…"
+    compose run --rm subfinder -dL "/data/out/$TS/in_domains.txt" -all -silent -o "/data/out/$TS/subs.subfinder.txt" || true
+    if [[ "${1:-}" == "sweep" ]]; then
+      log "amass (passive, sweep)…"
+      compose run --rm amass enum -norecursive -passive -df "/data/out/$TS/in_domains.txt" -o "/data/out/$TS/subs.amass.txt" || true
+    fi
+    # include apex domains + all sub sources (subs.*.txt = subfinder [+ amass]) so nothing is dropped
+    cat "$OUT"/subs.*.txt "$OUT/in_domains.txt" 2>/dev/null | sort -u > "$OUT/subs.txt"
+
+    if [[ -f "$resolv" ]]; then
+      log "dnsx (custom resolvers)…"
+      resopts=()
+      while read -r r; do
+        r="${r%$'\r'}"   # tolerate CRLF (Windows-edited resolvers.txt)
+        [[ -n "$r" && "$r" != \#* ]] && resopts+=(-r "$r")
+      done < "$resolv"
+      compose run --rm dnsx -l "/data/out/$TS/subs.txt" "${resopts[@]}" -a -o "/data/out/$TS/resolved.txt" || true
+    else
+      log "dnsx…"
+      compose run --rm dnsx -l "/data/out/$TS/subs.txt" -a -o "/data/out/$TS/resolved.txt" || true
+    fi
+    [[ -s "$OUT/resolved.txt" ]] && cut -d' ' -f1 "$OUT/resolved.txt" | sort -u > "$OUT/hosts_resolved.txt"
+  else
+    log "no domains in input — skipping subfinder + dnsx"
+  fi
+
+  # ── Combined scan targets: resolved hosts + literal IPs + CIDRs ────────────
+  cat "$OUT/hosts_resolved.txt" "$OUT/in_ips.txt" "$OUT/in_cidrs.txt" 2>/dev/null | sort -u > "$OUT/scan_targets.txt"
+  if [[ ! -s "$OUT/scan_targets.txt" ]]; then
+    log "no scan targets — nothing to scan"; return 0
+  fi
 
   log "naabu ports (top)…"
-  compose run --rm naabu -list "/data/out/$TS/hosts_resolved.txt" -top-ports "$(yqg '.scan.naabu.top_ports')" --rate "$(yqg '.scan.naabu.rate')" -silent -o "/data/out/$TS/ports.naabu.txt"
+  compose run --rm naabu -list "/data/out/$TS/scan_targets.txt" -top-ports "$(yqg '.scan.naabu.top_ports')" --rate "$(yqg '.scan.naabu.rate')" -silent -o "/data/out/$TS/ports.naabu.txt" || true
 
   log "nmap follow-up (light -sV)…"
-  awk -F: '{print $1}' "$OUT/ports.naabu.txt" | sort -u > "$OUT/hosts_for_nmap.txt"
+  awk -F: '{print $1}' "$OUT/ports.naabu.txt" 2>/dev/null | sort -u > "$OUT/hosts_for_nmap.txt"
   [[ -s "$OUT/hosts_for_nmap.txt" ]] && compose run --rm nmap nmap -sV --version-light -T3 -iL "/data/out/$TS/hosts_for_nmap.txt" --top-ports 20 -oX "/data/out/$TS/nmap.xml" || true
 
   log "httpx (title/tech)…"
-  awk -F: '{print "http://"$1; print "https://"$1}' "$OUT/ports.naabu.txt" | sort -u > "$OUT/urls.txt"
-compose run --rm httpx \
-  -l "/data/out/$TS/urls.txt" \
-  -json \
-  -silent \
-  -status-code \
-  -title \
-  -tech-detect \
-  -o "/data/out/$TS/httpx.json"
+  # build URLs preserving the discovered port (host may be IPv4/hostname or [IPv6]); split on last colon
+  awk -F: 'NF>=2 { port=$NF; host=substr($0,1,length($0)-length($NF)-1);
+                   if (host!="" && port ~ /^[0-9]+$/) { print "http://"host":"port; print "https://"host":"port } }' \
+    "$OUT/ports.naabu.txt" 2>/dev/null | sort -u > "$OUT/urls.txt"
+  [[ -s "$OUT/urls.txt" ]] && compose run --rm httpx \
+    -l "/data/out/$TS/urls.txt" \
+    -json -silent -status-code -title -tech-detect \
+    -o "/data/out/$TS/httpx.json" || true
+
+  # ── Crawl (sweep only): expand the URL surface so nuclei tests more than site roots ──
+  if [[ "${1:-}" == "sweep" && "$(yqg '.scan.katana.enable')" == "true" && -s "$OUT/httpx.json" ]]; then
+    local jc=""
+    [[ "$(yqg '.scan.katana.js_crawl')" == "true" ]] && jc="-jc" || true
+    jq -r '.url' "$OUT/httpx.json" 2>/dev/null | sort -u > "$OUT/httpx_live.txt"
+    log "katana (crawl, depth $(yqg '.scan.katana.depth'))…"
+    compose run --rm katana -list "/data/out/$TS/httpx_live.txt" -d "$(yqg '.scan.katana.depth')" $jc -silent -o "/data/out/$TS/katana.txt" || true
+    if [[ -s "$OUT/katana.txt" ]]; then
+      cat "$OUT/urls.txt" "$OUT/katana.txt" 2>/dev/null | sort -u > "$OUT/urls.all.txt" && mv "$OUT/urls.all.txt" "$OUT/urls.txt"
+      log "katana: url surface expanded to $(wc -l <"$OUT/urls.txt"|tr -d ' ')"
+    fi
+  fi
 
   log "[✓] STRIP discovery complete."
 }
 
-weekly() {
- local domains="$STRIP_HOME/$(yqg '.inputs.domains_file' | sed 's#^\./##')"
-  local resolv="$STRIP_HOME/$(yqg '.inputs.resolvers_file' | sed 's#^\./##')"
-  need "$domains"
-  log "Output → $OUT"
-  cp "$domains" "$OUT/domains.txt"
-
-  log "amass (passive)…"
-  compose run --rm amass enum -norecursive -passive -df "/data/out/$TS/domains.txt" -o "/data/out/$TS/subs.amass.txt" || true
-  sort -u "$OUT"/subs.*.txt > "$OUT/subs.txt" || cp "$OUT/subs.subfinder.txt" "$OUT/subs.txt"
-    log "testssl…"
-    compose run --rm testssl --file "/data/out/$TS/urls.txt" --jsonfile "/data/out/$TS/testssl.json" || true
-      log "[✓] STRIP weekly discovery complete."
-}	
 webscan(){
   local sev="${1:-$(yqg '.scan.nuclei.severity_daily')}"
   log "nuclei HTTP (severity: $sev)…"
@@ -160,101 +195,188 @@ webscan(){
   log "[✓] Web/TLS done."
 }
 
-cloud(){
-  [[ "$(yqg '.cloud.enable')" == "true" ]] || { log "cloud disabled"; return 0; }
-  mkdir -p "$OUT/cloud/prowler" "$OUT/cloud/scoutsuite"
+tls(){
+  [[ "$(yqg '.scan.tls.testssl')" == "true" ]] || { log "testssl disabled"; return 0; }
+  # Assess live HTTPS services only (skip plain http); derived from httpx output
+  if [[ -s "$OUT/httpx.json" ]]; then
+    jq -r 'select(.scheme=="https") | .url' "$OUT/httpx.json" 2>/dev/null | sort -u > "$OUT/https_urls.txt" || true
+  fi
+  if [[ ! -s "$OUT/https_urls.txt" ]]; then
+    log "testssl: no HTTPS services found — skipping"
+    return 0
+  fi
+  local n; n="$(wc -l < "$OUT/https_urls.txt" | tr -d ' ')"
+  log "testssl (TLS assessment, --fast) on $n target(s)…"
+  compose run --rm testssl --fast --warnings batch \
+    --file "/data/out/$TS/https_urls.txt" \
+    --jsonfile "/data/out/$TS/testssl.json" || true
+  log "[✓] testssl done."
+}
 
-  if [[ -f "$STRIP_HOME/data/creds/aws/credentials" ]] || [[ -n "${AWS_ROLE_ARN:-}" ]]; then
-    log "prowler (AWS)…"
-    compose run --rm prowler aws -M json,csv -o "/data/out/$TS/cloud/prowler/aws"
-    log "ScoutSuite (AWS)…"
-    compose run --rm scoutsuite scout aws --report-dir "/data/out/$TS/cloud/scoutsuite/aws" || true
-  fi
-  local az_env="$STRIP_HOME/$(yqg '.cloud.azure_env_file' | sed 's#^\./##')"
-  if [[ -f "$az_env" ]]; then
-    set -a; source "$az_env"; set +a
-    log "prowler (Azure)…"
-    compose run --rm prowler azure -M json,csv -o "/data/out/$TS/cloud/prowler/azure" || true
-    log "ScoutSuite (Azure)…"
-    compose run --rm scoutsuite scout azure --report-dir "/data/out/$TS/cloud/scoutsuite/azure" || true
-  fi
-  local gcp_key="$STRIP_HOME/$(yqg '.cloud.gcp_key_file' | sed 's#^\./##')"
-  if [[ -f "$gcp_key" ]]; then
-    log "prowler (GCP)…"
-    compose run --rm prowler gcp -M json,csv -o "/data/out/$TS/cloud/prowler/gcp" || true
-    log "ScoutSuite (GCP)…"
-    compose run --rm scoutsuite scout gcp --report-dir "/data/out/$TS/cloud/scoutsuite/gcp" || true
-  fi
-  log "[✓] Cloud checks done."
+shots(){
+  [[ "$(yqg '.screenshots.enable')" == "true" ]] || { log "screenshots disabled"; return 0; }
+  [[ -s "$OUT/httpx.json" ]] || { log "shots: no live web services — skipping"; return 0; }
+  jq -r '.url' "$OUT/httpx.json" 2>/dev/null | sort -u > "$OUT/shot_urls.txt"
+  [[ -s "$OUT/shot_urls.txt" ]] || { log "shots: no urls — skipping"; return 0; }
+  mkdir -p "$OUT/screenshots"
+  log "gowitness (screenshots)…"
+  compose run --rm gowitness scan file \
+    -f "/data/out/$TS/shot_urls.txt" \
+    --screenshot-path "/data/out/$TS/screenshots" \
+    --write-jsonl --write-jsonl-file "/data/out/$TS/gowitness.jsonl" \
+    --threads "$(yqg '.screenshots.gowitness.workers')" \
+    --delay "$(yqg '.screenshots.gowitness.delay')" || true
+  log "[✓] screenshots done."
 }
 
 merge(){
   local R="$OUT"
   log "Merging outputs…"
-[[ -s "$R/httpx.json" ]] && \
-jq -c '
-  {
-    fqdn: (.url // ""),
-    host: (.host // ""),
-    ip:   (.input // .ip // ""),
-    status: (.status_code // 0),
-    title:  (.title // ""),
-    tech:
-      (
-        (.tech // .technologies // "") |
-        if type=="string" then
-          (if . == "" then [] else (split(",") | map(ascii_downcase)) end)
-        elif type=="array" then
-          (map(tostring | ascii_downcase))
-        else
-          []
-        end
-      ),
-    observed_at:"'"$TS"'",
-    source:"httpx"
-  }' "$R/httpx.json" > "$R/web_assets.ndjson" || true
 
+  # url→screenshot lookup from the gowitness manifest (empty object if none)
+  if [[ -s "$R/gowitness.jsonl" ]]; then
+    jq -s 'map(select(.url) | {(.url): ("screenshots/" + (.file_name // .screenshot // ""))}) | add // {}' \
+      "$R/gowitness.jsonl" > "$R/.shots_map.json" 2>/dev/null || echo '{}' > "$R/.shots_map.json"
+  else
+    echo '{}' > "$R/.shots_map.json"
+  fi
+
+  # resolvable-hostname set for TR-004 hostname_resolvable (from dnsx output)
+  local RES_MAP='{}'
+  if [[ -s "$R/resolved.txt" ]]; then
+    RES_MAP="$(cut -d' ' -f1 "$R/resolved.txt" | sort -u | jq -R . | jq -cs 'map({(.):true}) | add // {}')" || RES_MAP='{}'
+  fi
+
+  # ── web_assets.ndjson (httpx) — TR-004 provenance ─────────────────────────
+  [[ -s "$R/httpx.json" ]] && \
+  jq -c --argjson shots "$(cat "$R/.shots_map.json")" --argjson resolved "$RES_MAP" '
+    (.host // "") as $h
+    | (($h|test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) or ($h|test(":"))) as $hisip
+    | { source_module: "STRIP",
+      source_tool:   "httpx",
+      scan_id:       "'"$SCAN_TS"'",
+      observed_at:   "'"$SCAN_TS"'",
+      fqdn:          (.url // ""),
+      hostname_at_observation_time: (if ($h=="" or $hisip) then null else $h end),
+      hostname_resolvable:          (if $hisip then false else ($resolved[$h] // false) end),
+      ip_at_observation_time:       (.input // .ip // ""),
+      status: (.status_code // 0),
+      title:  (.title // ""),
+      tech:
+        ( (.tech // .technologies // "")
+          | if type=="string" then (if .=="" then [] else (split(",")|map(ascii_downcase)) end)
+            elif type=="array" then (map(tostring|ascii_downcase))
+            else [] end ),
+      screenshot: ($shots[(.url // "")] // "")
+    }' "$R/httpx.json" > "$R/web_assets.ndjson" || true
+
+  # ── services.ndjson (naabu + nmap) — TR-004 provenance ────────────────────
+  : > "$R/.services.raw.ndjson"
   if [[ -f "$R/ports.naabu.txt" ]]; then
-    awk -F: '{printf("{\"host\":\"%s\",\"port\":%d,\"source\":\"naabu\",\"observed_at\":\"%s\"}\n",$1,$2,"'"$TS"'");}' "$R/ports.naabu.txt" > "$R/services.ndjson"
+    awk -F: 'NF>=2 { port=$NF; host=substr($0,1,length($0)-length($NF)-1); gsub(/["\\]/,"",host);
+                     printf("{\"tool\":\"naabu\",\"target\":\"%s\",\"port\":%s}\n", host, port) }' \
+      "$R/ports.naabu.txt" >> "$R/.services.raw.ndjson"
   fi
   if [[ -f "$R/nmap.xml" ]]; then
-    xmlstarlet sel -t -m "//host/ports/port[state/@state='open']" \
-      -v "concat(../../address[@addrtype='ipv4']/@addr,'|',@portid,'|',service/@name,'|',service/@product,'|',service/@version)" -n "$R/nmap.xml" \
-    | awk -F'|' '{printf("{\"ip\":\"%s\",\"port\":%d,\"service\":\"%s\",\"product\":\"%s\",\"version\":\"%s\",\"source\":\"nmap\",\"observed_at\":\"%s\"}\n",$1,$2,$3,$4,$5,"'"$TS"'");}' \
-    >> "$R/services.ndjson"
+    # containerized XML parse (stdlib, no host xmlstarlet) — keeps service/product/version separate
+    compose run --rm xmlparse python3 -c '
+import sys, json, xml.etree.ElementTree as ET
+try:
+    root = ET.parse(sys.argv[1]).getroot()
+except Exception:
+    sys.exit(0)
+for host in root.findall("host"):
+    ip = ""
+    for a in host.findall("address"):
+        if a.get("addrtype") in ("ipv4", "ipv6"):
+            ip = a.get("addr", "")
+    for p in host.findall(".//port"):
+        st = p.find("state")
+        if st is None or st.get("state") != "open":
+            continue
+        s = p.find("service")
+        name = s.get("name", "") if s is not None else ""
+        prod = s.get("product", "") if s is not None else ""
+        ver = s.get("version", "") if s is not None else ""
+        print(json.dumps({"tool": "nmap", "target": ip,
+                          "port": int(p.get("portid", "0") or 0),
+                          "service": name, "product": prod, "version": ver}))
+' "/data/out/$TS/nmap.xml" 2>/dev/null >> "$R/.services.raw.ndjson" || true
   fi
+  [[ -s "$R/.services.raw.ndjson" ]] && \
+  jq -c -R --argjson resolved "$RES_MAP" '
+    fromjson? | select(.)
+    | (.target) as $t
+    | (($t|test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) or ($t|test(":"))) as $isip
+    | { source_module: "STRIP",
+        source_tool:   .tool,
+        scan_id:       "'"$SCAN_TS"'",
+        observed_at:   "'"$SCAN_TS"'",
+        hostname_at_observation_time: (if $isip then null else $t end),
+        hostname_resolvable:          (if $isip then false else ($resolved[$t] // false) end),
+        ip_at_observation_time:       (if $isip then $t else "" end),
+        port:    .port,
+        service: (.service // ""),
+        product: (.product // ""),
+        version: (.version // "")
+      }' "$R/.services.raw.ndjson" > "$R/services.ndjson" || true
 
+  # ── findings.ndjson (nuclei + testssl) — TR-004 provenance ────────────────
   { [[ -s "$R/nuclei.jsonl" ]] && jq -c -R 'fromjson? | select(.)' "$R/nuclei.jsonl"; } \
-| jq -c '{host:(.host//.ip),
-          url:.url,
-          template:(.templateID),
-          severity:(.severity|ascii_downcase),
-          name:(.info.name),
-          evidence:(.matcher_name // .["matcher-status"]),
-          source:"nuclei",
-          observed_at:"'"$TS"'",
-          raw:.}' \
-> "$R/findings.ndjson" 2>/dev/null || true
-[[ -s "$R/testssl.json" ]] && \
-jq -c -R 'fromjson? | select(.)' "$R/testssl.json" \
-| jq -c '
-  def flat: if type=="array" then .[] else . end;
-  flat | ( .scanResult // . ) | flat
-  | { ip: (.ip // .server // .target // .host // .fqdn // .hostname),
-      finding: (.finding // .id),
-      severity: (.severity // "info"),
-      source: "testssl",
-      observed_at: "'"$TS"'",
-      raw: .
-    }
-' >> "$R/findings.ndjson" || true
+  | jq -c --argjson resolved "$RES_MAP" '
+      (.host // "") as $h
+      | (($h|test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) or ($h|test(":"))) as $hisip
+      | { source_module: "STRIP",
+        source_tool:   "nuclei",
+        scan_id:       "'"$SCAN_TS"'",
+        observed_at:   "'"$SCAN_TS"'",
+        hostname_at_observation_time: (if ($h=="" or $hisip) then null else $h end),
+        hostname_resolvable:          (if $hisip then false else ($resolved[$h] // false) end),
+        ip_at_observation_time:       (.ip // .host // ""),
+        url:      .url,
+        template: (.templateID),
+        finding:  null,
+        severity: ((.severity // "info") | ascii_downcase),
+        name:     (.info.name),
+        evidence: (.matcher_name // .["matcher-status"]),
+        raw: .
+      }' > "$R/findings.ndjson" 2>/dev/null || true
 
-  [[ -s "$R/web_assets.ndjson" ]] && jq -r '[.fqdn,.host,.ip,.status,.title]|@csv' "$R/web_assets.ndjson" > "$R/web_assets.csv" || true
-  [[ -s "$R/services.ndjson"   ]] && jq -r '[.host//.ip,.port,.service//"",.product//"",.version//"",.title//""]|@csv' "$R/services.ndjson" > "$R/open_ports.csv" || true
-  [[ -s "$R/findings.ndjson"   ]] && jq -r '[.host//.ip,.url//"",.severity,.template//.finding,.source]|@csv' "$R/findings.ndjson" > "$R/findings_summary.csv" || true
-  # Ensure findings.ndjson has at least one line, so we know merge worked
+  [[ -s "$R/testssl.json" ]] && \
+  jq -c --argjson resolved "$RES_MAP" '
+    (if type=="object" and has("scanResult") then .scanResult else . end)
+    | (if type=="array" then .[] else . end)
+    | select(type=="object")
+    | ((.ip // "") | tostring | split("/")) as $hi
+    | ($hi[0] // "") as $h0
+    | (($h0|test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) or ($h0|test(":"))) as $h0isip
+    | (($hi|length) > 1 and ($h0isip | not)) as $hasname
+    | { source_module: "STRIP",
+        source_tool:   "testssl",
+        scan_id:       "'"$SCAN_TS"'",
+        observed_at:   "'"$SCAN_TS"'",
+        hostname_at_observation_time: (if $hasname then $h0 else null end),
+        hostname_resolvable:          (if $hasname then ($resolved[$h0] // false) else false end),
+        ip_at_observation_time:       ($hi[-1] // ""),
+        url:      null,
+        template: null,
+        finding:  (.finding // .id // ""),
+        severity: ((.severity // "info") | ascii_downcase),
+        name:     (.finding // .id // ""),
+        evidence: null,
+        raw: .
+      }
+    | select(.severity | IN("low","medium","high","critical"))
+  ' "$R/testssl.json" >> "$R/findings.ndjson" 2>/dev/null || true
+
+  # ── CSV exports (human-readable) ──────────────────────────────────────────
+  [[ -s "$R/web_assets.ndjson" ]] && jq -r '[.fqdn,.hostname_at_observation_time,.ip_at_observation_time,.status,.title]|@csv' "$R/web_assets.ndjson" > "$R/web_assets.csv" || true
+  [[ -s "$R/services.ndjson"   ]] && jq -r '[(.hostname_at_observation_time // .ip_at_observation_time),.port,.service,.product,.version]|@csv' "$R/services.ndjson" > "$R/open_ports.csv" || true
+  [[ -s "$R/findings.ndjson"   ]] && jq -r '[(.hostname_at_observation_time // .ip_at_observation_time),(.url // ""),.severity,(.template // .finding),.source_tool]|@csv' "$R/findings.ndjson" > "$R/findings_summary.csv" || true
+
+  # sentinel so an empty findings file is distinguishable from a failed merge (BACKSTAGE skips it)
   if [[ ! -s "$R/findings.ndjson" ]]; then
-    echo "{\"message\":\"No findings from this run\",\"observed_at\":\"$TS\"}" > "$R/findings.ndjson"
+    echo "{\"source_module\":\"STRIP\",\"scan_id\":\"$SCAN_TS\",\"observed_at\":\"$SCAN_TS\",\"message\":\"No findings from this run\"}" > "$R/findings.ndjson"
   fi
 
   log "[✓] Merge complete → $R"
@@ -262,7 +384,7 @@ jq -c -R 'fromjson? | select(.)' "$R/testssl.json" \
 
 usage(){
   cat <<USAGE
-STRIP — Surface Threat Reconnaissance & Identification Platform
+STRIP v$STRIP_VERSION — Surface Threat Reconnaissance & Identification Platform
 
 Setup (first time only):
   stripctl setup                  # Download Nuclei templates to Docker volume
@@ -273,8 +395,8 @@ Discovery & Scanning:
   stripctl run weekly             # Comprehensive weekly scan (includes medium severity)
 
 Additional:
-  stripctl cloud                  # Cloud security audit (AWS/Azure/GCP)
   stripctl merge                  # Consolidate scan results into reports
+  stripctl version                # Print the STRIP version
 
 Examples:
   # First time setup (optional - auto-runs if templates missing)
@@ -312,25 +434,24 @@ case "${1:-}" in
         ensure_nuclei_templates
         discover
         webscan "$(yqg '.scan.nuclei.severity_daily')"
-        cloud
-        merge 
+        tls
+        shots
+        merge
         ;;
-      weekly) 
+      weekly)
         ensure_nuclei_templates
-        discover
+        discover sweep
         webscan "$(yqg '.scan.nuclei.severity_weekly')"
-        cloud
-        merge 
+        tls
+        shots
+        merge
         ;;
       *) 
         usage 
         ;;
     esac 
     ;;
-  cloud) 
-    cloud 
-    ;;
-  merge) 
+  merge)
     merge 
     ;;
   *) 

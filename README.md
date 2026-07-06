@@ -27,30 +27,36 @@ STRIP automates the discovery and assessment of internet-facing assets through a
 ### What STRIP Does
 
 ```
-domains.txt → subdomain discovery → DNS resolution → port scanning 
-            → web probing → vulnerability scanning → reports
+targets.txt (domains / IPs / CIDRs) → subdomain discovery → DNS resolution
+            → port scanning → web probing → screenshots → crawling (sweep)
+            → vulnerability + TLS scanning → normalized reports
 ```
 
 **Key Capabilities:**
 - 🔍 Automated subdomain enumeration
-- 🌐 DNS resolution and validation  
+- 🌐 DNS resolution and validation
+- 🎯 Domain, IP, and CIDR range targets
 - 🔓 Port and service discovery
 - 🌍 HTTP/HTTPS service profiling
-- 🎯 Template-based vulnerability scanning
+- 🕸️ Web crawling for surface expansion (weekly sweep)
+- 📸 Screenshot capture / visual recon
+- 🛡️ Template-based vulnerability scanning
 - 🔒 TLS/SSL configuration assessment
-- ☁️ Cloud security posture assessment (AWS/Azure/GCP)
-- 📊 Structured outputs (JSON, CSV)
+- 📊 Structured outputs (NDJSON, CSV)
 
 ---
 
 ## Quick Start
 
 ### Prerequisites
-- Docker & Docker Compose
+- Docker & Docker Compose (v2)
 - `yq` (YAML processor) - [Installation guide](https://github.com/mikefarah/yq)
 - `jq` (JSON processor) - Usually pre-installed on Linux/macOS
 
-**Note for Apple Silicon Users (M1/M2/M3):** For optimal performance, see [Apple Silicon Setup](#apple-silicon-setup) below.
+**Platform notes:**
+- **Linux** — runs natively; `network_mode: host` gives real host networking (best performance). Install `yq`/`jq` via your package manager.
+- **macOS** — Docker Desktop; works out of the box. amd64-only tool images (gowitness) run under emulation on Apple Silicon (screenshots still work, just slower).
+- **Windows** — run inside **WSL2** (Docker Desktop for Windows already uses it); clone and run `stripctl` from the WSL2 shell. Native PowerShell is not supported.
 
 
 ### Installation
@@ -74,7 +80,7 @@ EOF
 ```
 ---
 
-**Intel Macs, Windows, and Linux users:** No action needed - the default configuration works out of the box.
+**Linux, macOS, and Windows (WSL2) users:** The default configuration works out of the box.
 
 ---
 ### First Run
@@ -102,10 +108,9 @@ That's it. STRIP works out of the box.
 ./stripctl run weekly
 
 # Individual phases
-./stripctl setup                 # initial setup of nuceli (automatically checked with nuceli runs)
-./stripctl discover              # Subdomain discovery + port scanning
-./stripctl cloud                 # Cloud security assessment
-./stripctl merge                 # Normalize outputs to CSV/JSON
+./stripctl setup                 # First-time Nuclei template setup (auto-checked on runs)
+./stripctl discover              # Subdomain → DNS → port → HTTP discovery
+./stripctl merge                 # Normalize outputs to NDJSON/CSV
 ```
 
 ### Configuration
@@ -120,9 +125,13 @@ scan:
   nuclei:
     severity_daily: "high,critical"
     severity_weekly: "medium,high,critical"
+  katana:
+    enable: true         # Web crawl during the weekly sweep (daily never crawls)
+  tls:
+    testssl: true        # TLS/SSL assessment of live HTTPS services
 
-cloud:
-  enable: false          # Enable for AWS/Azure/GCP scanning
+screenshots:
+  enable: true           # Screenshot capture with gowitness
 ```
 
 ---
@@ -131,15 +140,20 @@ cloud:
 
 ```
 data/out/20260125-143022/
-├── domains.txt              # Input domains
-├── subs.txt                 # Discovered subdomains
+├── domains.txt              # Input targets (domains / IPs / CIDRs)
+├── subs.txt                 # Discovered subdomains (+ apex; + amass on weekly)
 ├── resolved.txt             # DNS resolution results
+├── scan_targets.txt         # Combined port-scan targets (resolved hosts + IPs + CIDRs)
 ├── ports.naabu.txt          # Open ports (host:port)
-├── nmap.xml                 # Service fingerprints
+├── nmap.xml                 # Service fingerprints (XML — parsed by merge; also for C2 import)
 ├── httpx.json               # HTTP service details
+├── urls.txt                 # Probed URLs (port-accurate; expanded by katana on weekly)
+├── screenshots/             # gowitness screenshots
+├── gowitness.jsonl          # Screenshot manifest (url → image file)
+├── katana.txt               # Crawled URLs (weekly sweep)
 ├── nuclei.jsonl             # Vulnerability findings
-├── testssl.json             # TLS/SSL assessment (weekly)
-├── web_assets.ndjson        # Normalized web assets
+├── testssl.json             # TLS/SSL assessment
+├── web_assets.ndjson        # Normalized web assets (incl. screenshot path)
 ├── web_assets.csv           # CSV export
 ├── findings.ndjson          # Normalized vulnerability findings
 └── findings_summary.csv     # CSV export
@@ -161,9 +175,8 @@ STRIP leverages best-in-class open-source security tools:
 | | [httpx](https://github.com/projectdiscovery/httpx) | HTTP probing & tech detection |
 | **Assessment** | [nuclei](https://github.com/projectdiscovery/nuclei) | Vulnerability scanning (templates) |
 | | [testssl.sh](https://testssl.sh/) | TLS/SSL security assessment |
-| **Recon** | [katana](https://github.com/projectdiscovery/katana) | Web crawling (future plan) |
-| **Cloud** | [prowler](https://github.com/prowler-cloud/prowler) | Cloud security (AWS/Azure/GCP) |
-| | [ScoutSuite](https://github.com/nccgroup/ScoutSuite) | Multi-cloud security auditing |
+| **Recon** | [katana](https://github.com/projectdiscovery/katana) | Web crawling / surface expansion (weekly sweep) |
+| | [gowitness](https://github.com/sensepost/gowitness) | Screenshot capture / visual recon |
 
 ---
 
@@ -199,36 +212,6 @@ EOF
 ```
 
 See [docs/API_KEYS.md](docs/API_KEYS.md) for detailed setup instructions.
-
-### Cloud Security Scanning
-
-To enable AWS/Azure/GCP security assessments:
-
-```bash
-# 1. Enable in config
-# Edit strip.yaml:
-cloud:
-  enable: true
-
-# 2. Add cloud credentials
-# AWS
-mkdir -p data/creds/aws
-cp ~/.aws/credentials data/creds/aws/
-cp ~/.aws/config data/creds/aws/
-
-# Azure
-cat > data/creds/azure/.env <<EOF
-AZURE_CLIENT_ID=your-client-id
-AZURE_CLIENT_SECRET=your-client-secret
-AZURE_TENANT_ID=your-tenant-id
-EOF
-
-# GCP
-cp ~/path/to/service-account-key.json data/creds/gcp/key.json
-
-# 3. Run cloud scan
-./stripctl cloud
-```
 
 ---
 
@@ -272,22 +255,22 @@ EOF
 
 ## Workflow Details
 
-### Daily Scan (`stripctl run daily`)
+### Daily Scan (`stripctl run daily`) — Phase 1
 
 1. **discover** - Subdomain enumeration → DNS resolution → port scanning → HTTP probing
-2. **web-scan** - Nuclei templates (high/critical severity only)
-3. **shots** - Screenshot capture
-4. **cloud** - Cloud security assessment (if enabled)
+2. **web-scan** - Nuclei templates (high/critical severity)
+3. **tls** - testssl.sh assessment of live HTTPS services
+4. **shots** - Screenshot capture (gowitness)
 5. **merge** - Normalize all outputs to NDJSON/CSV
 
 **Duration:** ~10-30 minutes (depending on target size)
 
-### Weekly Scan (`stripctl run weekly`)
+### Weekly Scan (`stripctl run weekly`) — Phase 1 + Sweep
 
-Same as daily, plus:
-- Amass (more comprehensive subdomain discovery)
+Everything in the daily scan, plus a deeper **sweep**:
+- Amass (comprehensive subdomain discovery, unioned into one scan)
+- Katana (web crawling → expands the URL surface Nuclei tests)
 - Nuclei (medium/high/critical severity)
-- testssl.sh (TLS/SSL deep analysis)
 
 **Duration:** ~30-90 minutes
 
@@ -374,8 +357,8 @@ open_ports.csv          - Port scan results
 | **Cost** | Free | Free | Free | Free | $$$$ |
 | **Automation** | Full | Manual/scripted | Partial | Partial | Full |
 | **Vulnerability Scanning** | ✓ (Nuclei) | ✗ | ✗ | ✓ | ✓ |
-| **Cloud Assessment** | ✓ | ✗ | ✗ | ✗ | ✓ |
 | **Visual Recon** | ✓ | ✗ | ✗ | ✗ | ✓ |
+| **Domain / IP / CIDR input** | ✓ | Partial | Partial | ✓ | ✓ |
 | **Learning Curve** | Low | Medium | Low | High | Medium |
 
 ---
@@ -420,13 +403,10 @@ chmod +x /usr/local/bin/yq
 ```
 ### Gowitness is slow on Apple Silicon
 
-If screenshot capture is slow on M1/M2/M3 Macs:
-```bash
-# Use ARM-optimized build
-cp docker-compose.override.yml.example docker-compose.override.yml
-docker compose build gowitness
-docker compose up -d gowitness
-```
+The gowitness image is amd64-only, so on Apple Silicon (M-series) it runs under emulation —
+handled automatically by the `platform: linux/amd64` pin in `docker-compose.yml`. Screenshots
+still work, just slower. On amd64 Linux/Windows it runs natively.
+
 ---
 
 ## Roadmap
@@ -489,8 +469,7 @@ STRIP stands on the shoulders of giants. Huge thanks to:
 - [ProjectDiscovery](https://github.com/projectdiscovery) - subfinder, nuclei, httpx, naabu, dnsx, katana
 - [OWASP Amass](https://github.com/owasp-amass/amass) - Comprehensive subdomain discovery
 - [testssl.sh](https://github.com/drwetter/testssl.sh) - TLS/SSL testing
-- [Prowler](https://github.com/prowler-cloud/prowler) - Cloud security
-- [ScoutSuite](https://github.com/nccgroup/ScoutSuite) - Multi-cloud auditing
+- [gowitness](https://github.com/sensepost/gowitness) - Screenshot capture
 
 And the entire open-source security community.
 

@@ -1,0 +1,17 @@
+# Normalize line endings. Force LF on the shell orchestrator and configs so a
+# Windows checkout (core.autocrlf=true) never gives bash CRLF it can't run.
+* text=auto eol=lf
+
+stripctl   text eol=lf
+*.sh       text eol=lf
+*.bash     text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.txt      text eol=lf
+*.md       text eol=lf
+
+# Binary assets — never touch
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
