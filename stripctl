@@ -11,6 +11,7 @@ SCAN_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"   # ISO 8601 UTC — record timestamp /
 # run-dir keeps the original YYYYMMDD-HHMMSS format (UTC, derived from SCAN_TS) so nothing parsing
 # directory names breaks — TR-004 only requires ISO 8601 on the record fields, not the dir.
 TS="$(d=${SCAN_TS%%T*}; t=${SCAN_TS#*T}; t=${t%Z}; echo "${d//-/}-${t//:/}")"
+START_EPOCH="$(date +%s)"                    # run start (for run_manifest duration_seconds)
 DATA_DIR="${DATA_DIR:-$(pwd)/data}"
 OUT="$STRIP_HOME/${OUTROOT#./}/$TS"
 mkdir -p "$OUT"
@@ -133,12 +134,16 @@ discover(){
         r="${r%$'\r'}"   # tolerate CRLF (Windows-edited resolvers.txt)
         [[ -n "$r" && "$r" != \#* ]] && resopts+=(-r "$r")
       done < "$resolv"
-      compose run --rm dnsx -l "/data/out/$TS/subs.txt" "${resopts[@]}" -a -o "/data/out/$TS/resolved.txt" || true
+      compose run --rm dnsx -l "/data/out/$TS/subs.txt" "${resopts[@]}" -a -aaaa -cname -asn -json -silent -o "/data/out/$TS/resolved.json" >/dev/null 2>&1 || true
     else
       log "dnsx…"
-      compose run --rm dnsx -l "/data/out/$TS/subs.txt" -a -o "/data/out/$TS/resolved.txt" || true
+      compose run --rm dnsx -l "/data/out/$TS/subs.txt" -a -aaaa -cname -asn -json -silent -o "/data/out/$TS/resolved.json" >/dev/null 2>&1 || true
     fi
-    [[ -s "$OUT/resolved.txt" ]] && cut -d' ' -f1 "$OUT/resolved.txt" | sort -u > "$OUT/hosts_resolved.txt"
+    # resolvable hostnames (source for hostname_resolvable + naabu targets), derived from the JSON
+    if [[ -s "$OUT/resolved.json" ]]; then
+      jq -r 'select(((.a//[])+(.aaaa//[]))|length>0) | .host' "$OUT/resolved.json" 2>/dev/null | sort -u > "$OUT/resolved.txt"
+      cp "$OUT/resolved.txt" "$OUT/hosts_resolved.txt" 2>/dev/null || true
+    fi
   else
     log "no domains in input — skipping subfinder + dnsx"
   fi
@@ -164,6 +169,7 @@ discover(){
   [[ -s "$OUT/urls.txt" ]] && compose run --rm httpx \
     -l "/data/out/$TS/urls.txt" \
     -json -silent -status-code -title -tech-detect \
+    -server -content-type -content-length -location -hash sha256 -tls-grab \
     -o "/data/out/$TS/httpx.json" || true
 
   # ── Crawl (sweep only): expand the URL surface so nuclei tests more than site roots ──
@@ -229,56 +235,92 @@ shots(){
   log "[✓] screenshots done."
 }
 
+# run_manifest.json (sensor-output/1.0 §5) — provenance + legal/authorization record
+manifest(){
+  local R="$1" nowu dur authed streams counts nd ni nc s n
+  nowu="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  dur=$(( $(date +%s) - ${START_EPOCH:-$(date +%s)} ))
+  authed="$(yqg '.run.authorized_by' 2>/dev/null)"; [[ -z "$authed" || "$authed" == "null" ]] && authed="UNATTESTED"
+  nd=$(wc -l <"$R/in_domains.txt" 2>/dev/null | tr -d ' '); nd=${nd:-0}
+  ni=$(wc -l <"$R/in_ips.txt"     2>/dev/null | tr -d ' '); ni=${ni:-0}
+  nc=$(wc -l <"$R/in_cidrs.txt"   2>/dev/null | tr -d ' '); nc=${nc:-0}
+  streams='[]'; counts='{}'
+  for s in hosts services web_assets tls dns findings; do
+    [[ -s "$R/$s.ndjson" ]] || continue
+    streams=$(jq -c --arg s "$s.ndjson" '. + [$s]' <<<"$streams")
+    if grep -q '"message":"No records' "$R/$s.ndjson"; then n=0; else n=$(grep -c '' "$R/$s.ndjson" 2>/dev/null || echo 0); fi
+    counts=$(jq -c --arg k "$s" --argjson v "${n:-0}" '. + {($k):$v}' <<<"$counts")
+  done
+  jq -n \
+    --arg m STRIP --arg sid "$SCAN_TS" --arg prof "${PROFILE:-manual}" \
+    --arg st "$SCAN_TS" --arg fin "$nowu" --argjson dur "$dur" \
+    --arg op "$(id -un 2>/dev/null || echo user)@$(hostname -s 2>/dev/null || echo host)" \
+    --arg auth "$authed" \
+    --argjson tot "$((nd+ni+nc))" --argjson ips "$ni" --argjson cidrs "$nc" --argjson hn "$nd" \
+    --argjson streams "$streams" --argjson counts "$counts" \
+    '{source_module:$m, scan_id:$sid, spec_version:"sensor-output/1.0", profile:$prof,
+      started_at:$st, finished_at:$fin, duration_seconds:$dur, operator:$op, authorized_by:$auth,
+      targets:{total:$tot, ips:$ips, cidrs:$cidrs, hostnames:$hn},
+      tool_versions:{}, streams_emitted:$streams, record_counts:$counts}' \
+    > "$R/run_manifest.json" 2>/dev/null || true
+}
+
 merge(){
   local R="$OUT"
-  log "Merging outputs…"
+  log "Merging outputs → sensor-output/1.0…"
 
-  # url→screenshot lookup from the gowitness manifest (empty object if none)
+  # per-stream sentinel (spec §2.11): distinguish "no records" from a failed run
+  _sent(){ [[ -s "$1" ]] || printf '{"source_module":"STRIP","scan_id":"%s","observed_at":"%s","message":"No records for this stream"}\n' "$SCAN_TS" "$SCAN_TS" > "$1"; }
+
+  # ── lookups ───────────────────────────────────────────────────────────────
   if [[ -s "$R/gowitness.jsonl" ]]; then
     jq -s 'map(select(.url) | {(.url): ("screenshots/" + (.file_name // .screenshot // ""))}) | add // {}' \
       "$R/gowitness.jsonl" > "$R/.shots_map.json" 2>/dev/null || echo '{}' > "$R/.shots_map.json"
-  else
-    echo '{}' > "$R/.shots_map.json"
-  fi
+  else echo '{}' > "$R/.shots_map.json"; fi
+  local SHOTS RES_MAP='{}' H2IP='{}'
+  SHOTS="$(cat "$R/.shots_map.json")"
+  [[ -s "$R/resolved.txt" ]]  && { RES_MAP="$(sort -u "$R/resolved.txt" | jq -R . | jq -cs 'map({(.):true})|add // {}')" || RES_MAP='{}'; }
+  [[ -s "$R/resolved.json" ]] && { H2IP="$(jq -cs 'map({(.host): ((.a//[])[0])}) | add // {}' "$R/resolved.json")" || H2IP='{}'; }
 
-  # resolvable-hostname set for TR-004 hostname_resolvable (from dnsx output)
-  local RES_MAP='{}'
-  if [[ -s "$R/resolved.txt" ]]; then
-    RES_MAP="$(cut -d' ' -f1 "$R/resolved.txt" | sort -u | jq -R . | jq -cs 'map({(.):true}) | add // {}')" || RES_MAP='{}'
-  fi
+  # ── dns.ndjson (dnsx) ──────────────────────────────────────────────────────
+  [[ -s "$R/resolved.json" ]] && \
+  jq -c --argjson resolved "$RES_MAP" '
+    ( [ (.a//[])[]    | {t:"A",   v:.} ]
+    + [ (.aaaa//[])[] | {t:"AAAA",v:.} ]
+    + ( if (.cname|type)=="string" and .cname!="" then [{t:"CNAME",v:.cname}]
+        elif (.cname|type)=="array" then (.cname|map({t:"CNAME",v:.})) else [] end ) ) as $recs
+    | .host as $name | (.ttl // null) as $ttl
+    | $recs[]
+    | { source_module:"STRIP", source_tool:"dnsx", scan_id:"'"$SCAN_TS"'", observed_at:"'"$SCAN_TS"'",
+        ip_at_observation_time: null,
+        hostname_at_observation_time: $name,
+        hostname_resolvable: (if $name==null then null else ($resolved[$name] // true) end),
+        record_type: .t, name: $name, value: .v, ttl: $ttl, root_domain: null, is_wildcard: null }
+  ' "$R/resolved.json" > "$R/dns.ndjson" 2>/dev/null || true
+  _sent "$R/dns.ndjson"
 
-  # ── web_assets.ndjson (httpx) — TR-004 provenance ─────────────────────────
-  [[ -s "$R/httpx.json" ]] && \
-  jq -c --argjson shots "$(cat "$R/.shots_map.json")" --argjson resolved "$RES_MAP" '
-    (.host // "") as $h
-    | (($h|test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) or ($h|test(":"))) as $hisip
-    | { source_module: "STRIP",
-      source_tool:   "httpx",
-      scan_id:       "'"$SCAN_TS"'",
-      observed_at:   "'"$SCAN_TS"'",
-      fqdn:          (.url // ""),
-      hostname_at_observation_time: (if ($h=="" or $hisip) then null else $h end),
-      hostname_resolvable:          (if $hisip then false else ($resolved[$h] // false) end),
-      ip_at_observation_time:       (.input // .ip // ""),
-      status: (.status_code // 0),
-      title:  (.title // ""),
-      tech:
-        ( (.tech // .technologies // "")
-          | if type=="string" then (if .=="" then [] else (split(",")|map(ascii_downcase)) end)
-            elif type=="array" then (map(tostring|ascii_downcase))
-            else [] end ),
-      screenshot: ($shots[(.url // "")] // "")
-    }' "$R/httpx.json" > "$R/web_assets.ndjson" || true
+  # ── hosts.ndjson (one record per observed IP) ─────────────────────────────
+  { [[ -s "$R/resolved.json" ]] && jq -r '((.a//[])[]),((.aaaa//[])[])' "$R/resolved.json";
+    [[ -s "$R/in_ips.txt" ]] && cat "$R/in_ips.txt"; } 2>/dev/null | sort -u > "$R/.host_ips.txt"
+  [[ -s "$R/.host_ips.txt" ]] && \
+  jq -R -c '
+    . as $ip
+    | ($ip|test("^(10\\.|127\\.|169\\.254\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|::1$|fc|fd)")) as $priv
+    | { source_module:"STRIP", source_tool:"dnsx", scan_id:"'"$SCAN_TS"'", observed_at:"'"$SCAN_TS"'",
+        ip_at_observation_time:$ip, hostname_at_observation_time:null, hostname_resolvable:null,
+        is_private:$priv, ptr_record:null, asn:null, asn_org:null, country_code:null,
+        mac:null, netbios:null, os_name:null, os_accuracy:null }
+  ' "$R/.host_ips.txt" > "$R/hosts.ndjson" 2>/dev/null || true
+  _sent "$R/hosts.ndjson"
 
-  # ── services.ndjson (naabu + nmap) — TR-004 provenance ────────────────────
+  # ── services.ndjson (naabu + nmap → one row per host,port,protocol) ────────
   : > "$R/.services.raw.ndjson"
   if [[ -f "$R/ports.naabu.txt" ]]; then
     awk -F: 'NF>=2 { port=$NF; host=substr($0,1,length($0)-length($NF)-1); gsub(/["\\]/,"",host);
-                     printf("{\"tool\":\"naabu\",\"target\":\"%s\",\"port\":%s}\n", host, port) }' \
+                     printf("{\"tool\":\"naabu\",\"target\":\"%s\",\"port\":%s,\"protocol\":\"tcp\",\"state\":\"open\"}\n", host, port) }' \
       "$R/ports.naabu.txt" >> "$R/.services.raw.ndjson"
   fi
   if [[ -f "$R/nmap.xml" ]]; then
-    # containerized XML parse (stdlib, no host xmlstarlet) — keeps service/product/version separate
     compose run --rm xmlparse python3 -c '
 import sys, json, xml.etree.ElementTree as ET
 try:
@@ -295,52 +337,119 @@ for host in root.findall("host"):
         if st is None or st.get("state") != "open":
             continue
         s = p.find("service")
-        name = s.get("name", "") if s is not None else ""
-        prod = s.get("product", "") if s is not None else ""
-        ver = s.get("version", "") if s is not None else ""
-        print(json.dumps({"tool": "nmap", "target": ip,
-                          "port": int(p.get("portid", "0") or 0),
-                          "service": name, "product": prod, "version": ver}))
+        g = (lambda k: (s.get(k, "") if s is not None else ""))
+        cpes = [c.text for c in (s.findall("cpe") if s is not None else [])]
+        print(json.dumps({"tool":"nmap","target":ip,"port":int(p.get("portid","0") or 0),
+                          "protocol":p.get("protocol","tcp"),"state":st.get("state","open"),
+                          "service":g("name"),"product":g("product"),"version":g("version"),
+                          "extra_info":g("extrainfo"),"cpe":cpes}))
 ' "/data/out/$TS/nmap.xml" 2>/dev/null >> "$R/.services.raw.ndjson" || true
   fi
   [[ -s "$R/.services.raw.ndjson" ]] && \
-  jq -c -R --argjson resolved "$RES_MAP" '
-    fromjson? | select(.)
-    | (.target) as $t
-    | (($t|test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) or ($t|test(":"))) as $isip
-    | { source_module: "STRIP",
-        source_tool:   .tool,
-        scan_id:       "'"$SCAN_TS"'",
-        observed_at:   "'"$SCAN_TS"'",
-        hostname_at_observation_time: (if $isip then null else $t end),
-        hostname_resolvable:          (if $isip then false else ($resolved[$t] // false) end),
-        ip_at_observation_time:       (if $isip then $t else "" end),
-        port:    .port,
-        service: (.service // ""),
-        product: (.product // ""),
-        version: (.version // "")
-      }' "$R/.services.raw.ndjson" > "$R/services.ndjson" || true
+  jq -s -c --argjson resolved "$RES_MAP" --argjson h2ip "$H2IP" '
+    def isip($x): ($x|test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) or ($x|test(":"));
+    def nz: if (.=="" or .==null) then null else . end;
+    ( map(fromjson? // .) | map(select(type=="object")) ) as $rows
+    | $rows
+    | map( .target as $t
+      | { ip:(if isip($t) then $t else ($h2ip[$t] // $t) end),
+          hostname:(if isip($t) then null else $t end),
+          port:.port, protocol:(.protocol//"tcp"), state:(.state//"open"),
+          service:(.service|nz), product:(.product|nz), version:(.version|nz),
+          extra_info:(.extra_info|nz), cpe:(.cpe//[]), tool:.tool } )
+    | group_by([.ip,.port,.protocol])
+    | map( (map(select(.tool=="nmap"))|last) as $n
+         | (map(.hostname)|map(select(.!=null))|first) as $hn
+         | .[0] as $b
+         | { source_module:"STRIP", source_tool:(if $n then "nmap" else "naabu" end),
+             scan_id:"'"$SCAN_TS"'", observed_at:"'"$SCAN_TS"'",
+             ip_at_observation_time:($b.ip|nz),
+             hostname_at_observation_time:($hn // null),
+             hostname_resolvable:(if ($hn // null)==null then null else ($resolved[$hn] // false) end),
+             port:$b.port, protocol:$b.protocol,
+             state:( if (map(.state)|any(.=="open")) then "open" else $b.state end ),
+             service:($n.service // null), product:($n.product // null), version:($n.version // null),
+             extra_info:($n.extra_info // null), banner:null, cpe:($n.cpe // []) } )
+    | .[]
+  ' "$R/.services.raw.ndjson" > "$R/services.ndjson" 2>/dev/null || true
+  _sent "$R/services.ndjson"
 
-  # ── findings.ndjson (nuclei + testssl) — TR-004 provenance ────────────────
+  # ── web_assets.ndjson (httpx) ──────────────────────────────────────────────
+  [[ -s "$R/httpx.json" ]] && \
+  jq -c --argjson shots "$SHOTS" --argjson resolved "$RES_MAP" '
+    (.host // "") as $h
+    | (($h|test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) or ($h|test(":"))) as $hisip
+    | (if ($h=="" or $hisip) then null else $h end) as $hn
+    | { source_module:"STRIP", source_tool:"httpx", scan_id:"'"$SCAN_TS"'", observed_at:"'"$SCAN_TS"'",
+        ip_at_observation_time: ((.host_ip // ((.a//[])[0]) // "") | if .=="" then null else . end),
+        hostname_at_observation_time: $hn,
+        hostname_resolvable: (if $hn==null then null else ($resolved[$hn] // false) end),
+        url: (.url // ""),
+        port: ((.port // "") | if type=="number" then . elif .=="" then null else (tonumber? // null) end),
+        status: (.status_code // null),
+        title: (.title // null),
+        server: (.webserver // null),
+        content_type: (.content_type // null),
+        content_length: (.content_length // null),
+        redirect_url: (.location // null),
+        response_hash: (.hash.body_sha256 // null),
+        tech: ((.tech // []) | map({name:., version:null, category:null, confidence:null})),
+        screenshot: ($shots[(.url // "")] // null) }
+  ' "$R/httpx.json" > "$R/web_assets.ndjson" 2>/dev/null || true
+  _sent "$R/web_assets.ndjson"
+
+  # ── tls.ndjson (httpx tls-grab — home of fingerprint_sha256) ───────────────
+  [[ -s "$R/httpx.json" ]] && \
+  jq -c --argjson resolved "$RES_MAP" '
+    select(.tls != null and ((.tls.fingerprint_hash.sha256 // "") != ""))
+    | (.host // "") as $h
+    | (($h|test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) or ($h|test(":"))) as $hisip
+    | (if ($h=="" or $hisip) then null else $h end) as $hn
+    | { source_module:"STRIP", source_tool:"httpx", scan_id:"'"$SCAN_TS"'", observed_at:"'"$SCAN_TS"'",
+        ip_at_observation_time: ((.host_ip // ((.a//[])[0]) // "") | if .=="" then null else . end),
+        hostname_at_observation_time: $hn,
+        hostname_resolvable: (if $hn==null then null else ($resolved[$hn] // false) end),
+        port: ((.port // "") | if type=="number" then . elif .=="" then 443 else (tonumber? // 443) end),
+        fingerprint_sha256: .tls.fingerprint_hash.sha256,
+        subject_cn: (.tls.subject_cn // null),
+        subject_sans: (.tls.subject_an // []),
+        issuer: (.tls.issuer_cn // .tls.issuer_dn // null),
+        not_before: (.tls.not_before // null),
+        not_after: (.tls.not_after // null),
+        serial_number: (.tls.serial // null),
+        key_algorithm: null, key_bits: null, signature_algorithm: null,
+        grade: null, issues: [] }
+  ' "$R/httpx.json" > "$R/tls.ndjson" 2>/dev/null || true
+  _sent "$R/tls.ndjson"
+
+  # ── findings.ndjson (nuclei + testssl, unified §4.5) ───────────────────────
   { [[ -s "$R/nuclei.jsonl" ]] && jq -c -R 'fromjson? | select(.)' "$R/nuclei.jsonl"; } \
   | jq -c --argjson resolved "$RES_MAP" '
       (.host // "") as $h
       | (($h|test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) or ($h|test(":"))) as $hisip
-      | { source_module: "STRIP",
-        source_tool:   "nuclei",
-        scan_id:       "'"$SCAN_TS"'",
-        observed_at:   "'"$SCAN_TS"'",
-        hostname_at_observation_time: (if ($h=="" or $hisip) then null else $h end),
-        hostname_resolvable:          (if $hisip then false else ($resolved[$h] // false) end),
-        ip_at_observation_time:       (.ip // .host // ""),
-        url:      .url,
-        template: (.templateID),
-        finding:  null,
-        severity: ((.severity // "info") | ascii_downcase),
-        name:     (.info.name),
-        evidence: (.matcher_name // .["matcher-status"]),
-        raw: .
-      }' > "$R/findings.ndjson" 2>/dev/null || true
+      | (if ($h=="" or $hisip) then null else $h end) as $hn
+      | ( .info.classification["cve-id"] // [] | if type=="array" then . else [.] end ) as $cve
+      | ( .info.classification["cwe-id"] // [] | if type=="array" then . else [.] end ) as $cwe
+      | ( .info.reference // [] | if type=="array" then . else [.] end ) as $refs
+      | { source_module:"STRIP", source_tool:"nuclei", scan_id:"'"$SCAN_TS"'", observed_at:"'"$SCAN_TS"'",
+          ip_at_observation_time: ((.ip // "") | if .=="" then null else . end),
+          hostname_at_observation_time: $hn,
+          hostname_resolvable: (if $hn==null then null else ($resolved[$hn] // false) end),
+          url: (.url // .["matched-at"] // null),
+          port: (.port // null),
+          category: (if ($cve|length)>0 then "vulnerability" elif ((.info.severity//"")=="info") then "information" else "exposure" end),
+          template_id: (.["template-id"] // .templateID // null),
+          cve_id: ($cve[0] // null),
+          cwe_id: ($cwe[0] // null),
+          title: (.info.name // "unknown"),
+          description: (.info.description // null),
+          severity: ((.info.severity // .severity // "info")|ascii_downcase),
+          cvss_score: (.info.classification["cvss-score"] // null | if type=="string" then (tonumber? // null) else . end),
+          cvss_vector: (.info.classification["cvss-metrics"] // null),
+          matched_at: (.["matched-at"] // null),
+          evidence: (.["matcher-name"] // .matcher_name // null),
+          references: $refs, remediation: (.info.remediation // null), raw: . }
+  ' > "$R/findings.ndjson" 2>/dev/null || true
 
   [[ -s "$R/testssl.json" ]] && \
   jq -c --argjson resolved "$RES_MAP" '
@@ -350,35 +459,35 @@ for host in root.findall("host"):
     | ((.ip // "") | tostring | split("/")) as $hi
     | ($hi[0] // "") as $h0
     | (($h0|test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) or ($h0|test(":"))) as $h0isip
-    | (($hi|length) > 1 and ($h0isip | not)) as $hasname
-    | { source_module: "STRIP",
-        source_tool:   "testssl",
-        scan_id:       "'"$SCAN_TS"'",
-        observed_at:   "'"$SCAN_TS"'",
+    | (($hi|length) > 1 and ($h0isip|not)) as $hasname
+    | { source_module:"STRIP", source_tool:"testssl", scan_id:"'"$SCAN_TS"'", observed_at:"'"$SCAN_TS"'",
+        ip_at_observation_time: (($hi[-1] // "") | if .=="" then null else . end),
         hostname_at_observation_time: (if $hasname then $h0 else null end),
-        hostname_resolvable:          (if $hasname then ($resolved[$h0] // false) else false end),
-        ip_at_observation_time:       ($hi[-1] // ""),
-        url:      null,
-        template: null,
-        finding:  (.finding // .id // ""),
-        severity: ((.severity // "info") | ascii_downcase),
-        name:     (.finding // .id // ""),
-        evidence: null,
-        raw: .
-      }
+        hostname_resolvable: (if $hasname then ($resolved[$h0] // false) else null end),
+        url: null,
+        port: ((.port // null) | if type=="string" then (tonumber? // null) else . end),
+        category: "weak_tls",
+        template_id: (.id // null),
+        cve_id: (.cve // null),
+        cwe_id: null,
+        title: (.id // .finding // "tls_issue"),
+        description: (.finding // null),
+        severity: ((.severity // "info")|ascii_downcase),
+        cvss_score: null, cvss_vector: null, matched_at: null,
+        evidence: (.finding // null),
+        references: [], remediation: null, raw: . }
     | select(.severity | IN("low","medium","high","critical"))
   ' "$R/testssl.json" >> "$R/findings.ndjson" 2>/dev/null || true
+  _sent "$R/findings.ndjson"
 
-  # ── CSV exports (human-readable) ──────────────────────────────────────────
-  [[ -s "$R/web_assets.ndjson" ]] && jq -r '[.fqdn,.hostname_at_observation_time,.ip_at_observation_time,.status,.title]|@csv' "$R/web_assets.ndjson" > "$R/web_assets.csv" || true
-  [[ -s "$R/services.ndjson"   ]] && jq -r '[(.hostname_at_observation_time // .ip_at_observation_time),.port,.service,.product,.version]|@csv' "$R/services.ndjson" > "$R/open_ports.csv" || true
-  [[ -s "$R/findings.ndjson"   ]] && jq -r '[(.hostname_at_observation_time // .ip_at_observation_time),(.url // ""),.severity,(.template // .finding),.source_tool]|@csv' "$R/findings.ndjson" > "$R/findings_summary.csv" || true
+  # ── CSV summaries (lossy convenience; NDJSON is the contract) ──────────────
+  [[ -s "$R/hosts.ndjson" ]]      && jq -r 'select(has("message")|not)|[.ip_at_observation_time,.is_private,.ptr_record,.asn,.mac]|@csv' "$R/hosts.ndjson" > "$R/hosts.csv" 2>/dev/null || true
+  [[ -s "$R/services.ndjson" ]]   && jq -r 'select(has("message")|not)|[(.hostname_at_observation_time // .ip_at_observation_time),.port,.protocol,.service,.product,.version]|@csv' "$R/services.ndjson" > "$R/open_ports.csv" 2>/dev/null || true
+  [[ -s "$R/web_assets.ndjson" ]] && jq -r 'select(has("message")|not)|[.url,(.hostname_at_observation_time // .ip_at_observation_time),.status,.title,.server]|@csv' "$R/web_assets.ndjson" > "$R/web_assets.csv" 2>/dev/null || true
+  [[ -s "$R/tls.ndjson" ]]        && jq -r 'select(has("message")|not)|[(.hostname_at_observation_time // .ip_at_observation_time),.port,.fingerprint_sha256,.subject_cn,.not_after]|@csv' "$R/tls.ndjson" > "$R/tls.csv" 2>/dev/null || true
+  [[ -s "$R/findings.ndjson" ]]   && jq -r 'select(has("message")|not)|[(.hostname_at_observation_time // .ip_at_observation_time),.url,.severity,.category,(.cve_id // .template_id),.source_tool]|@csv' "$R/findings.ndjson" > "$R/findings_summary.csv" 2>/dev/null || true
 
-  # sentinel so an empty findings file is distinguishable from a failed merge (BACKSTAGE skips it)
-  if [[ ! -s "$R/findings.ndjson" ]]; then
-    echo "{\"source_module\":\"STRIP\",\"scan_id\":\"$SCAN_TS\",\"observed_at\":\"$SCAN_TS\",\"message\":\"No findings from this run\"}" > "$R/findings.ndjson"
-  fi
-
+  manifest "$R"
   log "[✓] Merge complete → $R"
 }
 
@@ -431,6 +540,7 @@ case "${1:-}" in
   run)
     case "${2:-}" in
       daily)  
+        PROFILE=daily
         ensure_nuclei_templates
         discover
         webscan "$(yqg '.scan.nuclei.severity_daily')"
@@ -439,6 +549,7 @@ case "${1:-}" in
         merge
         ;;
       weekly)
+        PROFILE=weekly
         ensure_nuclei_templates
         discover sweep
         webscan "$(yqg '.scan.nuclei.severity_weekly')"

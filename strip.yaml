@@ -4,6 +4,9 @@ inputs:
   domains_file: "./data/in/domains.txt"
   resolvers_file: "./data/in/resolvers.txt"  # optional
 
+run:
+  authorized_by: ""      # attestation recorded in run_manifest.json; blank → UNATTESTED
+
 scan:
   naabu:
     top_ports: "1000"

@@ -139,24 +139,26 @@ screenshots:
 ## Output Structure
 
 ```
-data/out/20260125-143022/
+data/out/20260709-143205/
+│   # ── raw tool output ──
 ├── domains.txt              # Input targets (domains / IPs / CIDRs)
-├── subs.txt                 # Discovered subdomains (+ apex; + amass on weekly)
-├── resolved.txt             # DNS resolution results
-├── scan_targets.txt         # Combined port-scan targets (resolved hosts + IPs + CIDRs)
-├── ports.naabu.txt          # Open ports (host:port)
-├── nmap.xml                 # Service fingerprints (XML — parsed by merge; also for C2 import)
-├── httpx.json               # HTTP service details
-├── urls.txt                 # Probed URLs (port-accurate; expanded by katana on weekly)
+├── resolved.json            # DNS resolution (dnsx -json)
+├── scan_targets.txt         # Combined port-scan targets
+├── ports.naabu.txt          # Open ports (naabu)
+├── nmap.xml                 # Service fingerprints (nmap -oX; parsed by merge; also C2 import)
+├── httpx.json               # HTTP probe details (incl. TLS certificate grab)
+├── nuclei.jsonl             # Raw vulnerability findings
+├── testssl.json             # Raw TLS assessment
 ├── screenshots/             # gowitness screenshots
-├── gowitness.jsonl          # Screenshot manifest (url → image file)
-├── katana.txt               # Crawled URLs (weekly sweep)
-├── nuclei.jsonl             # Vulnerability findings
-├── testssl.json             # TLS/SSL assessment
-├── web_assets.ndjson        # Normalized web assets (incl. screenshot path)
-├── web_assets.csv           # CSV export
-├── findings.ndjson          # Normalized vulnerability findings
-└── findings_summary.csv     # CSV export
+│   # ── normalized output (stable NDJSON contract; one JSON object per line) ──
+├── hosts.ndjson             # One record per live host
+├── services.ndjson          # One record per (host, port) — naabu + nmap merged
+├── web_assets.ndjson        # One record per HTTP(S) endpoint
+├── tls.ndjson               # One record per TLS certificate (SHA-256 fingerprint)
+├── dns.ndjson               # One record per DNS observation
+├── findings.ndjson          # One record per finding (nuclei + testssl)
+├── run_manifest.json        # Run provenance: operator, timings, record counts
+└── *.csv                    # Lossy human-readable summaries (hosts, open_ports, web_assets, tls, findings)
 ```
 
 ---
@@ -282,23 +284,35 @@ Everything in the daily scan, plus a deeper **sweep**:
 Machine-readable, easy to parse and query:
 
 ```bash
-# Find all critical vulnerabilities
+# Critical findings
 jq 'select(.severity=="critical")' data/out/*/findings.ndjson
 
-# List all web assets running WordPress
-jq 'select(.tech[]=="wordpress")' data/out/*/web_assets.ndjson
+# Findings that carry a CVE
+jq 'select(.cve_id != null) | {cve_id, severity, url}' data/out/*/findings.ndjson
+
+# Web assets running a given technology (tech is an array of objects)
+jq 'select(.tech[]?.name | ascii_downcase | test("wordpress"))' data/out/*/web_assets.ndjson
+
+# TLS certificate fingerprints (cross-host correlation anchor)
+jq -r '[.hostname_at_observation_time // .ip_at_observation_time, .fingerprint_sha256] | @tsv' data/out/*/tls.ndjson
 
 # Count findings by severity
 jq -r '.severity' data/out/*/findings.ndjson | sort | uniq -c
 ```
 
+Every record is self-describing (`source_module`, `source_tool`, `scan_id`, `observed_at`) and
+immutable. An empty stream is written as a single sentinel line (a record with a `message` key) —
+skip those when parsing.
+
 ### CSV
-Import into Excel, Google Sheets, or reporting tools:
+Lossy human summaries (NDJSON is the authoritative format):
 
 ```
-findings_summary.csv    - Vulnerability summary
-web_assets.csv          - Web services inventory
-open_ports.csv          - Port scan results
+hosts.csv            - Live hosts
+open_ports.csv       - Services (host, port, service, product, version)
+web_assets.csv       - Web endpoints
+tls.csv              - Certificates
+findings_summary.csv - Findings
 ```
 
 ---

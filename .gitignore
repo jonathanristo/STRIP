@@ -21,6 +21,13 @@ data/.config/subfinder/provider-config.yaml
 # Keep example
 !data/.config/subfinder/provider-config.yaml.example
 
+# Tool runtime configs written to XDG_CONFIG_HOME=/data/.config on each run
+data/.config/dnsx/
+data/.config/httpx/
+data/.config/katana/
+data/.config/nuclei/
+data/.config/subfinder/config.yaml
+
 # Scan Outputs (users generate their own)
 data/out/
 data/.cache/
