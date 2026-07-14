@@ -321,37 +321,41 @@ findings_summary.csv - Findings
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      stripctl (Bash)                        │
-│              Orchestration & Workflow Engine                │
+│                       stripctl (Bash)                        │
+│               Orchestration & Workflow Engine                │
 └─────────────────────────────────────────────────────────────┘
                             │
                 ┌───────────┼───────────┐
                 │           │           │
         ┌───────▼──┐   ┌────▼────┐  ┌──▼──────┐
         │subfinder │   │  dnsx   │  │ naabu   │
-        │  amass   │   │         │  │  nmap   │
+        │  amass   │   │(resolve)│  │  nmap   │
         └───────┬──┘   └────┬────┘  └──┬──────┘
-                │           │           │
-                └───────────┼───────────┘
+                │           │          │
+                └───────────┼──────────┘
                             │
                     ┌───────▼────────┐
                     │     httpx      │
-                    │   (probing)    │
+                    │  (probe/tech)  │
                     └───────┬────────┘
                             │
-                ┌───────────┼
-                │           │      
-        ┌───────▼──┐   ┌────▼────┐ 
-        │  nuclei  │   │testssl  │ 
-        └───────┬──┘   └────┬────┘ 
-                │           │
-                └───────────┼
-                            │
-                    ┌───────▼────────┐
-                    │     merge      │
-                    │  NDJSON + CSV  │
-                    └────────────────┘
+        ┌───────────┬───────┴───┬────────────┐
+        │           │           │            │
+   ┌────▼────┐ ┌────▼────┐ ┌────▼────┐ ┌──────▼─────┐
+   │ nuclei  │ │ testssl │ │ katana  │ │ gowitness  │
+   │ (vulns) │ │  (TLS)  │ │ (crawl) │ │ (screens)  │
+   └────┬────┘ └────┬────┘ └────┬────┘ └──────┬─────┘
+        │           │           │             │
+        └───────────┴─────┬─────┴─────────────┘
+                          │
+                  ┌───────▼────────┐
+                  │     merge      │
+                  │  NDJSON + CSV  │
+                  └────────────────┘
 ```
+
+> Phase 1 (`run daily`) flows discovery → httpx → nuclei → testssl → gowitness → merge. The weekly
+> sweep (`run weekly`) adds **amass** and **katana** (crawl → expands the surface nuclei tests).
 
 **Design Principles:**
 - **Containerized** - Every tool runs in isolation
