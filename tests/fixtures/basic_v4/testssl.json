@@ -1,0 +1,4 @@
+[
+ {"ip":"example.com/93.184.216.34","port":"443","id":"BREACH","finding":"potentially VULNERABLE, uses gzip HTTP compression","severity":"MEDIUM","cve":"CVE-2013-3587"},
+ {"ip":"example.com/93.184.216.34","port":"443","id":"cert_chain_of_trust","finding":"passed.","severity":"OK"}
+]

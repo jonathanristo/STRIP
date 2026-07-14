@@ -14,12 +14,81 @@ TS="$(d=${SCAN_TS%%T*}; t=${SCAN_TS#*T}; t=${t%Z}; echo "${d//-/}-${t//:/}")"
 START_EPOCH="$(date +%s)"                    # run start (for run_manifest duration_seconds)
 DATA_DIR="${DATA_DIR:-$(pwd)/data}"
 OUT="$STRIP_HOME/${OUTROOT#./}/$TS"
-mkdir -p "$OUT"
+# don't create a run dir when sourced for tests (STRIP_TEST_MODE=1) — tests only want the functions
+[[ "${STRIP_TEST_MODE:-0}" == "1" ]] || mkdir -p "$OUT"
 
 compose(){ docker compose -f "$STRIP_HOME/docker-compose.yml" "$@"; }
+# Run a containerized tool: -T (no pseudo-TTY) + stdin from /dev/null. The ProjectDiscovery tools
+# (dnsx/subfinder/naabu/httpx/nuclei/katana) read stdin, and `docker compose run` leaves stdin
+# attached as an idle, never-closed pipe when output is redirected or the run is non-interactive
+# (cron) — so they block forever waiting for EOF. Feeding /dev/null gives them an immediate EOF.
+# Every STRIP tool takes file/flag input, so none of them need a real stdin.
+crun(){ compose run --rm -T "$@" </dev/null; }
 yqg(){ yq -r "$1" "$CFG"; }
 log(){ echo "[STRIP $(date +%H:%M:%S)] $*"; }
 need(){ [[ -f "$1" ]] || { echo "Missing $1"; exit 1; }; }
+# newest run dir under OUTROOT that actually holds tool output — lets a standalone `merge` normalize
+# the real run instead of the empty timestamp dir this invocation just created at startup
+latest_run_dir(){
+  local root="$STRIP_HOME/${OUTROOT#./}" d
+  # sort by NAME (run dirs are YYYYMMDD-HHMMSS) not mtime — re-merging an old run bumps its mtime but
+  # must not make it "newest". A dir counts as a real run if discovery copied its input (domains.txt)
+  # OR any tool produced output — so a valid zero-result run still merges (into sentinels); the empty
+  # startup dir a standalone `merge` just created has none of these and is skipped.
+  for d in $(ls -1d "$root"/*/ 2>/dev/null | sort -r); do
+    d="${d%/}"
+    [[ -s "$d/domains.txt" || -s "$d/ports.naabu.txt" || -s "$d/resolved.json" || -s "$d/httpx.json" || -s "$d/nuclei.jsonl" ]] \
+      && { printf '%s\n' "$d"; return 0; }
+  done
+  return 1
+}
+
+# ── pure parsers (no side effects; stdin→stdout) — unit-tested in tests/parsers ────────────────────
+# host:port → "host<TAB>port", splitting on the LAST colon so IPv6 literals survive; strip [] and
+# drop non-numeric ports.
+sp_split_hostports(){
+  awk -F: 'NF>=2 { port=$NF; host=substr($0,1,length($0)-length($NF)-1); gsub(/[][]/,"",host);
+                   if (host!="" && port ~ /^[0-9]+$/) print host"\t"port }'
+}
+# host:port → http:// and https:// URLs, bracketing IPv6 literals as [addr]:port.
+sp_urls_from_hostports(){
+  awk -F: 'NF>=2 { port=$NF; host=substr($0,1,length($0)-length($NF)-1); gsub(/[][]/,"",host);
+                   if (host!="" && port ~ /^[0-9]+$/) { h=(host ~ /:/)?"["host"]":host;
+                   print "http://"h":"port; print "https://"h":"port } }'
+}
+# resolver file → cleaned list: strip CR, inline #comments, all whitespace, and blank lines.
+sp_clean_resolvers(){
+  sed -e 's/\r$//' -e 's/#.*//' -e 's/[[:space:]]//g' | grep -v '^$' || true
+}
+# host list → nmap targets for one address family ($1 = 4|6): IP literals of that family PLUS all
+# hostnames (a hostname resolves to the right family per run), sorted-unique.
+sp_nmap_hosts(){
+  local fam="${1:-4}" all names
+  all="$(cat)"
+  names="$(printf '%s\n' "$all" | grep -vE '^[0-9.]+$|:' || true)"   # hostnames (not IP literals)
+  { if [[ "$fam" == 6 ]]; then printf '%s\n' "$all" | grep ':' || true
+    else printf '%s\n' "$all" | grep -E '^[0-9.]+$' || true; fi
+    printf '%s\n' "$names"; } | grep -v '^$' | sort -u || true
+}
+# httpx JSON (NDJSON on stdin) → nuclei target URLs: the live services httpx confirmed, ONE per
+# host:port (preferring https over http). NOT the raw naabu http×https×port cross-product, which
+# includes dead scheme/port mismatches that only error against WAFs/CDNs and multiply the scan time.
+sp_nuclei_targets(){
+  jq -r 'select((.failed//false)|not) | "\(.host // "")|\(.port // "")\t\(.scheme // "http")\t\(.url // "")"' 2>/dev/null \
+    | awk -F'\t' 'NF>=3 && $3!="" {
+        if (!($1 in url) || ($2=="https" && sch[$1]!="https")) { url[$1]=$3; sch[$1]=$2 } }
+       END { for (k in url) print url[k] }' \
+    | sort -u
+}
+# nuclei's target list for a run dir ($1): httpx-VALIDATED live services (sp_nuclei_targets) plus any
+# katana-crawled URLs (sweep), deduped. It deliberately NEVER reads urls.txt — that raw cross-product
+# is unvalidated. Empty output means "nothing live" (httpx found nothing OR never ran) → caller skips.
+sp_nuclei_target_list(){
+  local d="$1"
+  { [[ -s "$d/httpx.json" ]] && sp_nuclei_targets < "$d/httpx.json"
+    [[ -s "$d/katana.txt" ]] && cat "$d/katana.txt"
+    true; } 2>/dev/null | sort -u
+}
 
 setup() {
   echo "═══════════════════════════════════════════════"
@@ -119,26 +188,35 @@ discover(){
   : > "$OUT/hosts_resolved.txt"
   if [[ -s "$OUT/in_domains.txt" ]]; then
     log "subfinder…"
-    compose run --rm subfinder -dL "/data/out/$TS/in_domains.txt" -all -silent -o "/data/out/$TS/subs.subfinder.txt" || true
+    crun subfinder -dL "/data/out/$TS/in_domains.txt" -all -silent -o "/data/out/$TS/subs.subfinder.txt" || true
     if [[ "${1:-}" == "sweep" ]]; then
       log "amass (passive, sweep)…"
-      compose run --rm amass enum -norecursive -passive -df "/data/out/$TS/in_domains.txt" -o "/data/out/$TS/subs.amass.txt" || true
+      crun amass enum -norecursive -passive -df "/data/out/$TS/in_domains.txt" -o "/data/out/$TS/subs.amass.txt" || true
     fi
-    # include apex domains + all sub sources (subs.*.txt = subfinder [+ amass]) so nothing is dropped
-    cat "$OUT"/subs.*.txt "$OUT/in_domains.txt" 2>/dev/null | sort -u > "$OUT/subs.txt"
+    # include apex domains + all sub sources (subs.*.txt = subfinder [+ amass]) so nothing is dropped.
+    # subs.*.txt may be absent if a source found nothing — tolerate the empty glob so set -e can't abort
+    # here; the apex domains file always exists and is the guaranteed fallback.
+    : > "$OUT/subs.txt"
+    cat "$OUT"/subs.*.txt 2>/dev/null >> "$OUT/subs.txt" || true
+    cat "$OUT/in_domains.txt" >> "$OUT/subs.txt"
+    sort -u -o "$OUT/subs.txt" "$OUT/subs.txt"
 
+    # optional custom resolvers: build one clean file (strip CR, inline comments, whitespace, blanks)
+    # and pass it as -r <file> — dnsx takes a resolver file, which is unambiguous vs. many -r flags
+    local nresolv=0 resflag=()
     if [[ -f "$resolv" ]]; then
-      log "dnsx (custom resolvers)…"
-      resopts=()
-      while read -r r; do
-        r="${r%$'\r'}"   # tolerate CRLF (Windows-edited resolvers.txt)
-        [[ -n "$r" && "$r" != \#* ]] && resopts+=(-r "$r")
-      done < "$resolv"
-      compose run --rm dnsx -l "/data/out/$TS/subs.txt" "${resopts[@]}" -a -aaaa -cname -asn -json -silent -o "/data/out/$TS/resolved.json" >/dev/null 2>&1 || true
-    else
-      log "dnsx…"
-      compose run --rm dnsx -l "/data/out/$TS/subs.txt" -a -aaaa -cname -asn -json -silent -o "/data/out/$TS/resolved.json" >/dev/null 2>&1 || true
+      sp_clean_resolvers < "$resolv" > "$OUT/resolvers.clean.txt" 2>/dev/null || true
+      nresolv="$(grep -c . "$OUT/resolvers.clean.txt" 2>/dev/null)"; nresolv="${nresolv:-0}"
+      [[ "$nresolv" -gt 0 ]] && resflag=(-r "/data/out/$TS/resolvers.clean.txt")
     fi
+    if [[ "$nresolv" -gt 0 ]]; then
+      log "dnsx ($nresolv custom resolvers) — resolving $(wc -l <"$OUT/subs.txt"|tr -d ' ') names…"
+    else
+      log "dnsx — resolving $(wc -l <"$OUT/subs.txt"|tr -d ' ') names…"
+    fi
+    # discard the stdout result echo (results go to the -o JSON) but KEEP stderr in dnsx.err for diagnosis
+    crun dnsx -l "/data/out/$TS/subs.txt" ${resflag[@]+"${resflag[@]}"} -a -aaaa -cname -json -silent -o "/data/out/$TS/resolved.json" >/dev/null 2>"$OUT/dnsx.err" \
+      || log "dnsx exited $? — see $OUT/dnsx.err"
     # resolvable hostnames (source for hostname_resolvable + naabu targets), derived from the JSON
     if [[ -s "$OUT/resolved.json" ]]; then
       jq -r 'select(((.a//[])+(.aaaa//[]))|length>0) | .host' "$OUT/resolved.json" 2>/dev/null | sort -u > "$OUT/resolved.txt"
@@ -155,19 +233,32 @@ discover(){
   fi
 
   log "naabu ports (top)…"
-  compose run --rm naabu -list "/data/out/$TS/scan_targets.txt" -top-ports "$(yqg '.scan.naabu.top_ports')" --rate "$(yqg '.scan.naabu.rate')" -silent -o "/data/out/$TS/ports.naabu.txt" || true
+  crun naabu -list "/data/out/$TS/scan_targets.txt" -top-ports "$(yqg '.scan.naabu.top_ports')" --rate "$(yqg '.scan.naabu.rate')" -silent -o "/data/out/$TS/ports.naabu.txt" || true
 
-  log "nmap follow-up (light -sV)…"
-  awk -F: '{print $1}' "$OUT/ports.naabu.txt" 2>/dev/null | sort -u > "$OUT/hosts_for_nmap.txt"
-  [[ -s "$OUT/hosts_for_nmap.txt" ]] && compose run --rm nmap nmap -sV --version-light -T3 -iL "/data/out/$TS/hosts_for_nmap.txt" --top-ports 20 -oX "/data/out/$TS/nmap.xml" || true
+  log "nmap follow-up (light -sV, discovered ports)…"
+  # host:port → hosts + the union of open ports (last-colon split, IPv6-safe — see sp_split_hostports)
+  sp_split_hostports < "$OUT/ports.naabu.txt" > "$OUT/.hostport.tsv" 2>/dev/null || true
+  cut -f1 "$OUT/.hostport.tsv" | sort -u > "$OUT/hosts_for_nmap.txt"
+  local nmap_ports; nmap_ports="$(cut -f2 "$OUT/.hostport.tsv" | sort -un | paste -sd, -)"
+  # nmap can't mix address families in one run. IP literals go to their own family; HOSTNAMES go to
+  # BOTH runs so dual-stack is fingerprinted (v4 resolves the A, -6 resolves the AAAA); nmap keeps the
+  # hostname in its XML, so merge re-associates it. -Pn: naabu already proved the ports open, so skip
+  # host discovery (ICMP/PN probes are often firewalled and would make nmap wrongly skip live hosts).
+  sp_nmap_hosts 4 < "$OUT/hosts_for_nmap.txt" > "$OUT/hosts_nmap4.txt" || true
+  sp_nmap_hosts 6 < "$OUT/hosts_for_nmap.txt" > "$OUT/hosts_nmap6.txt" || true
+  if [[ -s "$OUT/hosts_nmap4.txt" && -n "$nmap_ports" ]]; then
+    crun nmap -Pn -sV --version-light -T3 -iL "/data/out/$TS/hosts_nmap4.txt" -p "$nmap_ports" -oX "/data/out/$TS/nmap.xml" || true
+  fi
+  if [[ -s "$OUT/hosts_nmap6.txt" && -n "$nmap_ports" ]]; then
+    crun nmap -6 -Pn -sV --version-light -T3 -iL "/data/out/$TS/hosts_nmap6.txt" -p "$nmap_ports" -oX "/data/out/$TS/nmap6.xml" || true
+  fi
 
   log "httpx (title/tech)…"
-  # build URLs preserving the discovered port (host may be IPv4/hostname or [IPv6]); split on last colon
-  awk -F: 'NF>=2 { port=$NF; host=substr($0,1,length($0)-length($NF)-1);
-                   if (host!="" && port ~ /^[0-9]+$/) { print "http://"host":"port; print "https://"host":"port } }' \
-    "$OUT/ports.naabu.txt" 2>/dev/null | sort -u > "$OUT/urls.txt"
-  [[ -s "$OUT/urls.txt" ]] && compose run --rm httpx \
+  # build URLs preserving the discovered port; last-colon split + IPv6 bracketing (see sp_urls_from_hostports)
+  sp_urls_from_hostports < "$OUT/ports.naabu.txt" 2>/dev/null | sort -u > "$OUT/urls.txt" || true
+  [[ -s "$OUT/urls.txt" ]] && crun httpx \
     -l "/data/out/$TS/urls.txt" \
+    -rl "$(yqg '.scan.httpx.rate_limit')" \
     -json -silent -status-code -title -tech-detect \
     -server -content-type -content-length -location -hash sha256 -tls-grab \
     -o "/data/out/$TS/httpx.json" || true
@@ -178,7 +269,7 @@ discover(){
     [[ "$(yqg '.scan.katana.js_crawl')" == "true" ]] && jc="-jc" || true
     jq -r '.url' "$OUT/httpx.json" 2>/dev/null | sort -u > "$OUT/httpx_live.txt"
     log "katana (crawl, depth $(yqg '.scan.katana.depth'))…"
-    compose run --rm katana -list "/data/out/$TS/httpx_live.txt" -d "$(yqg '.scan.katana.depth')" $jc -silent -o "/data/out/$TS/katana.txt" || true
+    crun katana -list "/data/out/$TS/httpx_live.txt" -d "$(yqg '.scan.katana.depth')" $jc -silent -o "/data/out/$TS/katana.txt" || true
     if [[ -s "$OUT/katana.txt" ]]; then
       cat "$OUT/urls.txt" "$OUT/katana.txt" 2>/dev/null | sort -u > "$OUT/urls.all.txt" && mv "$OUT/urls.all.txt" "$OUT/urls.txt"
       log "katana: url surface expanded to $(wc -l <"$OUT/urls.txt"|tr -d ' ')"
@@ -190,13 +281,31 @@ discover(){
 
 webscan(){
   local sev="${1:-$(yqg '.scan.nuclei.severity_daily')}"
-  log "nuclei HTTP (severity: $sev)…"
-  compose run --rm nuclei -stats -rl "$(yqg '.scan.nuclei.rate_limit')" -c "$(yqg '.scan.nuclei.concurrency')" \
-    -severity "$sev" -ni -jsonl -l "/data/out/$TS/urls.txt" -o "/data/out/$TS/nuclei.jsonl" || true
+  # nuclei scans ONLY httpx-validated live services (+ katana crawl in a sweep) — never the raw naabu
+  # http×https×port cross-product in urls.txt (unvalidated; CDN/dead-scheme noise). httpx emits no JSON
+  # for failed probes, so "no validated targets" (all probes failed, or no web ports at all) means we
+  # SKIP nuclei rather than scan unvalidated URLs.
+  sp_nuclei_target_list "$OUT" > "$OUT/nuclei_targets.txt" 2>/dev/null || true
+  if [[ -s "$OUT/nuclei_targets.txt" ]]; then
+    local nlive; nlive="$(wc -l <"$OUT/nuclei_targets.txt" | tr -d ' ')"
+    log "nuclei HTTP (severity: $sev) — $nlive validated target(s)…"
+    crun nuclei -stats -rl "$(yqg '.scan.nuclei.rate_limit')" -c "$(yqg '.scan.nuclei.concurrency')" \
+      -severity "$sev" -ni -jsonl -l "/data/out/$TS/nuclei_targets.txt" -o "/data/out/$TS/nuclei.jsonl" || true
+  else
+    log "nuclei: no validated web targets — skipping"
+  fi
 
   if [[ "$(yqg '.scan.tls.sslyze')" == "true" ]]; then
-    log "sslyze…"
-    compose run --rm sslyze --json_out "/data/out/$TS/sslyze.json" --targets_in "/data/out/$TS/urls.txt" || true
+    # sslyze --targets_in wants host:port (not URLs) — derive from the discovered https services
+    : > "$OUT/sslyze_targets.txt"
+    [[ -s "$OUT/httpx.json" ]] && jq -r 'select(.scheme=="https") | .url' "$OUT/httpx.json" 2>/dev/null \
+      | sed -E 's#^https?://##; s#/.*$##' | sort -u > "$OUT/sslyze_targets.txt" || true
+    if [[ -s "$OUT/sslyze_targets.txt" ]]; then
+      log "sslyze ($(wc -l <"$OUT/sslyze_targets.txt"|tr -d ' ') targets)…"
+      crun sslyze --json_out "/data/out/$TS/sslyze.json" --targets_in "/data/out/$TS/sslyze_targets.txt" || true
+    else
+      log "sslyze: no https targets — skipping"
+    fi
   fi
   log "[✓] Web/TLS done."
 }
@@ -213,7 +322,7 @@ tls(){
   fi
   local n; n="$(wc -l < "$OUT/https_urls.txt" | tr -d ' ')"
   log "testssl (TLS assessment, --fast) on $n target(s)…"
-  compose run --rm testssl --fast --warnings batch \
+  crun testssl --fast --warnings batch \
     --file "/data/out/$TS/https_urls.txt" \
     --jsonfile "/data/out/$TS/testssl.json" || true
   log "[✓] testssl done."
@@ -226,7 +335,7 @@ shots(){
   [[ -s "$OUT/shot_urls.txt" ]] || { log "shots: no urls — skipping"; return 0; }
   mkdir -p "$OUT/screenshots"
   log "gowitness (screenshots)…"
-  compose run --rm gowitness scan file \
+  crun gowitness scan file \
     -f "/data/out/$TS/shot_urls.txt" \
     --screenshot-path "/data/out/$TS/screenshots" \
     --write-jsonl --write-jsonl-file "/data/out/$TS/gowitness.jsonl" \
@@ -241,9 +350,13 @@ manifest(){
   nowu="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   dur=$(( $(date +%s) - ${START_EPOCH:-$(date +%s)} ))
   authed="$(yqg '.run.authorized_by' 2>/dev/null)"; [[ -z "$authed" || "$authed" == "null" ]] && authed="UNATTESTED"
-  nd=$(wc -l <"$R/in_domains.txt" 2>/dev/null | tr -d ' '); nd=${nd:-0}
-  ni=$(wc -l <"$R/in_ips.txt"     2>/dev/null | tr -d ' '); ni=${ni:-0}
-  nc=$(wc -l <"$R/in_cidrs.txt"   2>/dev/null | tr -d ' '); nc=${nc:-0}
+  # count input classes defensively: a standalone `merge` on a run dir may have no in_*.txt files.
+  # NOTE: `x=$(wc -l < missing)` makes the ASSIGNMENT itself exit non-zero → set -e would abort here,
+  # so guard on file existence and only count files that are actually present.
+  nd=0; ni=0; nc=0
+  [[ -s "$R/in_domains.txt" ]] && nd=$(grep -c '' "$R/in_domains.txt" 2>/dev/null); nd=${nd:-0}
+  [[ -s "$R/in_ips.txt"     ]] && ni=$(grep -c '' "$R/in_ips.txt"     2>/dev/null); ni=${ni:-0}
+  [[ -s "$R/in_cidrs.txt"   ]] && nc=$(grep -c '' "$R/in_cidrs.txt"   2>/dev/null); nc=${nc:-0}
   streams='[]'; counts='{}'
   for s in hosts services web_assets tls dns findings; do
     [[ -s "$R/$s.ndjson" ]] || continue
@@ -267,7 +380,7 @@ manifest(){
 
 merge(){
   local R="$OUT"
-  log "Merging outputs → sensor-output/1.0…"
+  log "Normalizing raw tool outputs into sensor-output/1.0 streams (hosts/services/web_assets/tls/dns/findings)…"
 
   # per-stream sentinel (spec §2.11): distinguish "no records" from a failed run
   _sent(){ [[ -s "$1" ]] || printf '{"source_module":"STRIP","scan_id":"%s","observed_at":"%s","message":"No records for this stream"}\n' "$SCAN_TS" "$SCAN_TS" > "$1"; }
@@ -280,7 +393,7 @@ merge(){
   local SHOTS RES_MAP='{}' H2IP='{}'
   SHOTS="$(cat "$R/.shots_map.json")"
   [[ -s "$R/resolved.txt" ]]  && { RES_MAP="$(sort -u "$R/resolved.txt" | jq -R . | jq -cs 'map({(.):true})|add // {}')" || RES_MAP='{}'; }
-  [[ -s "$R/resolved.json" ]] && { H2IP="$(jq -cs 'map({(.host): ((.a//[])[0])}) | add // {}' "$R/resolved.json")" || H2IP='{}'; }
+  [[ -s "$R/resolved.json" ]] && { H2IP="$(jq -cs 'map({(.host): (((.a//[])[0]) // ((.aaaa//[])[0]))}) | add // {}' "$R/resolved.json")" || H2IP='{}'; }
 
   # ── dns.ndjson (dnsx) ──────────────────────────────────────────────────────
   [[ -s "$R/resolved.json" ]] && \
@@ -300,8 +413,11 @@ merge(){
   _sent "$R/dns.ndjson"
 
   # ── hosts.ndjson (one record per observed IP) ─────────────────────────────
+  # NOTE the trailing `|| true`: when in_ips.txt is absent/empty (any domains-only run) the group's
+  # last command returns non-zero, and under `set -o pipefail` that would abort the whole merge —
+  # leaving ONLY dns.ndjson. Do not remove it.
   { [[ -s "$R/resolved.json" ]] && jq -r '((.a//[])[]),((.aaaa//[])[])' "$R/resolved.json";
-    [[ -s "$R/in_ips.txt" ]] && cat "$R/in_ips.txt"; } 2>/dev/null | sort -u > "$R/.host_ips.txt"
+    [[ -s "$R/in_ips.txt" ]] && cat "$R/in_ips.txt"; } 2>/dev/null | sort -u > "$R/.host_ips.txt" || true
   [[ -s "$R/.host_ips.txt" ]] && \
   jq -R -c '
     . as $ip
@@ -316,12 +432,17 @@ merge(){
   # ── services.ndjson (naabu + nmap → one row per host,port,protocol) ────────
   : > "$R/.services.raw.ndjson"
   if [[ -f "$R/ports.naabu.txt" ]]; then
-    awk -F: 'NF>=2 { port=$NF; host=substr($0,1,length($0)-length($NF)-1); gsub(/["\\]/,"",host);
-                     printf("{\"tool\":\"naabu\",\"target\":\"%s\",\"port\":%s,\"protocol\":\"tcp\",\"state\":\"open\"}\n", host, port) }' \
-      "$R/ports.naabu.txt" >> "$R/.services.raw.ndjson"
+    # same IPv6-safe splitter discovery uses (strips [] brackets) so naabu rows normalize IDENTICALLY
+    # to nmap's — otherwise [2001:db8::1]:443 would keep its brackets and NOT group with nmap's
+    # 2001:db8::1, producing two duplicate services for one host:port.
+    sp_split_hostports < "$R/ports.naabu.txt" \
+      | awk -F'\t' '{ h=$1; gsub(/["\\]/,"",h);
+                      printf("{\"tool\":\"naabu\",\"target\":\"%s\",\"port\":%s,\"protocol\":\"tcp\",\"state\":\"open\"}\n", h, $2) }' \
+      >> "$R/.services.raw.ndjson" || true
   fi
-  if [[ -f "$R/nmap.xml" ]]; then
-    compose run --rm xmlparse python3 -c '
+  for _nx in nmap.xml nmap6.xml; do
+    [[ -f "$R/$_nx" ]] || continue
+    crun xmlparse python3 -c '
 import sys, json, xml.etree.ElementTree as ET
 try:
     root = ET.parse(sys.argv[1]).getroot()
@@ -332,6 +453,11 @@ for host in root.findall("host"):
     for a in host.findall("address"):
         if a.get("addrtype") in ("ipv4", "ipv6"):
             ip = a.get("addr", "")
+    hn = None
+    for h in host.findall("hostnames/hostname"):
+        if h.get("type") == "user":   # the name we targeted, not a reverse-DNS PTR
+            hn = h.get("name") or None
+            break
     for p in host.findall(".//port"):
         st = p.find("state")
         if st is None or st.get("state") != "open":
@@ -339,12 +465,12 @@ for host in root.findall("host"):
         s = p.find("service")
         g = (lambda k: (s.get(k, "") if s is not None else ""))
         cpes = [c.text for c in (s.findall("cpe") if s is not None else [])]
-        print(json.dumps({"tool":"nmap","target":ip,"port":int(p.get("portid","0") or 0),
+        print(json.dumps({"tool":"nmap","target":ip,"hostname":hn,"port":int(p.get("portid","0") or 0),
                           "protocol":p.get("protocol","tcp"),"state":st.get("state","open"),
                           "service":g("name"),"product":g("product"),"version":g("version"),
                           "extra_info":g("extrainfo"),"cpe":cpes}))
-' "/data/out/$TS/nmap.xml" 2>/dev/null >> "$R/.services.raw.ndjson" || true
-  fi
+' "/data/out/$TS/$_nx" 2>/dev/null >> "$R/.services.raw.ndjson" || true
+  done
   [[ -s "$R/.services.raw.ndjson" ]] && \
   jq -s -c --argjson resolved "$RES_MAP" --argjson h2ip "$H2IP" '
     def isip($x): ($x|test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) or ($x|test(":"));
@@ -352,8 +478,8 @@ for host in root.findall("host"):
     ( map(fromjson? // .) | map(select(type=="object")) ) as $rows
     | $rows
     | map( .target as $t
-      | { ip:(if isip($t) then $t else ($h2ip[$t] // $t) end),
-          hostname:(if isip($t) then null else $t end),
+      | { ip:(if isip($t) then $t else ($h2ip[$t] // null) end),
+          hostname:(if isip($t) then (.hostname // null) else $t end),
           port:.port, protocol:(.protocol//"tcp"), state:(.state//"open"),
           service:(.service|nz), product:(.product|nz), version:(.version|nz),
           extra_info:(.extra_info|nz), cpe:(.cpe//[]), tool:.tool } )
@@ -488,7 +614,7 @@ for host in root.findall("host"):
   [[ -s "$R/findings.ndjson" ]]   && jq -r 'select(has("message")|not)|[(.hostname_at_observation_time // .ip_at_observation_time),.url,.severity,.category,(.cve_id // .template_id),.source_tool]|@csv' "$R/findings.ndjson" > "$R/findings_summary.csv" 2>/dev/null || true
 
   manifest "$R"
-  log "[✓] Merge complete → $R"
+  log "[✓] Merge complete — 6 NDJSON streams + run_manifest.json written to $R"
 }
 
 usage(){
@@ -504,7 +630,7 @@ Discovery & Scanning:
   stripctl run weekly             # Comprehensive weekly scan (includes medium severity)
 
 Additional:
-  stripctl merge                  # Consolidate scan results into reports
+  stripctl merge [run-dir]        # Normalize a run into sensor-output/1.0 (default: latest populated run)
   stripctl version                # Print the STRIP version
 
 Examples:
@@ -530,9 +656,11 @@ Notes:
 USAGE
 }
 
+# CLI dispatch — skipped when sourced for tests (STRIP_TEST_MODE=1) so `source stripctl` starts no scan
+if [[ "${STRIP_TEST_MODE:-0}" != "1" ]]; then
 case "${1:-}" in
-  setup) 
-    setup 
+  setup)
+    setup
     ;;
   discover) 
     discover 
@@ -563,9 +691,26 @@ case "${1:-}" in
     esac 
     ;;
   merge)
-    merge 
+    # standalone merge: normalize an explicit run dir ($2) or the latest populated one — never the
+    # fresh empty dir this invocation just created (that would only write "no records" sentinels)
+    rmdir "$OUT" 2>/dev/null || true    # discard the unused empty startup dir
+    if [[ -n "${2:-}" ]]; then
+      [[ -d "$2" ]] || { echo "No such run dir: $2"; exit 1; }
+      OUT="${2%/}"
+    else
+      OUT="$(latest_run_dir)" || { echo "No populated run dir under $STRIP_HOME/${OUTROOT#./} — run 'discover' first"; exit 1; }
+      log "merge: using latest populated run dir → $OUT"
+    fi
+    TS="$(basename "$OUT")"    # keep container paths (/data/out/$TS/…) pointed at the resolved run dir
+    # rebuild the ISO scan_id from the run-dir timestamp so re-merging a run yields the SAME scan_id
+    # (and observed_at) as the original discovery — not a fresh merge-time id
+    if [[ "$TS" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})-([0-9]{2})([0-9]{2})([0-9]{2})$ ]]; then
+      SCAN_TS="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}T${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}Z"
+    fi
+    merge
     ;;
   *) 
     usage 
     ;;
 esac
+fi

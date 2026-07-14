@@ -436,6 +436,31 @@ still work, just slower. On amd64 Linux/Windows it runs natively.
 
 ---
 
+## Testing
+
+STRIP ships a layered regression suite under [`tests/`](tests/) — plain `bash` plus the tools STRIP
+already needs (`jq`, `docker`); no extra framework to install. Run it under **bash** (the suite sources
+`stripctl`, which relies on bash features `BASH_REMATCH`/arrays):
+
+```bash
+tests/run.sh                      # static + parsers + golden merge + tool contracts
+tests/run.sh parsers              # a single layer, by name filter
+STRIP_INTEGRATION=1 tests/run.sh  # also run the opt-in network integration layer
+```
+
+| Layer | Needs | Proves |
+|-------|-------|--------|
+| **Static** | — (docker/shellcheck optional) | `bash -n`, `docker compose config`, every tool invoked maps to a real compose service |
+| **Parsers** | — | host:port parsing (IPv4 / IPv6 / bracketed), URL building, resolver cleanup, nmap family split, nuclei target selection, run-dir selection |
+| **Golden merge** | docker (nmap fixture only) | real `merge` output vs a locked baseline for all six streams + `run_manifest.json`, across IPv4 / IPv6-literal / dual-stack / empty-run fixtures |
+| **Contracts** | docker | the current tool images accept the exact flags STRIP passes them |
+| **Integration** | docker + network, opt-in | live dnsx custom-resolver resolve + error capture |
+
+After an intentional change to `merge`, refresh the golden baseline with `tests/regen_golden.sh` and
+review the diff. See [`tests/README.md`](tests/README.md) for fixture details.
+
+---
+
 ## Contributing
 
 Contributions welcome! Please:
@@ -445,6 +470,15 @@ Contributions welcome! Please:
 3. Commit your changes (`git commit -m 'Add amazing feature'`)
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
+
+**Before submitting**, please verify:
+
+- `bash -n stripctl` parses clean and `docker compose config -q` validates.
+- `merge` output still conforms to **`sensor-output/1.0`** — the six NDJSON streams plus
+  `run_manifest.json`, `null` (not `""`) for absent scalars, one `services` row per host/port/protocol.
+- Parsing changes preserve behavior across IPv4, IPv6 (literal **and** bracketed), and hostname targets.
+
+Then run the regression suite — `tests/run.sh` (see [Testing](#testing) above).
 
 **Areas where we'd love help:**
 - Additional tool integrations

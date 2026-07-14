@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -6 -Pn -sV">
+<host>
+<address addr="2001:db8::7" addrtype="ipv6"/>
+<hostnames><hostname name="ds.example" type="user"/></hostnames>
+<ports>
+<port protocol="tcp" portid="443"><state state="open" reason="syn-ack"/><service name="https" product="nginx" version="1.24.0" extrainfo=""><cpe>cpe:/a:igor_sysoev:nginx:1.24.0</cpe></service></port>
+</ports>
+</host>
+</nmaprun>

@@ -1,0 +1,1 @@
+{"source_module":"STRIP","source_tool":"dnsx","scan_id":"TS","observed_at":"TS","ip_at_observation_time":null,"hostname_at_observation_time":"v6.example","hostname_resolvable":true,"record_type":"AAAA","name":"v6.example","value":"2001:db8::1","ttl":300,"root_domain":null,"is_wildcard":null}

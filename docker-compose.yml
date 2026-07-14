@@ -58,6 +58,7 @@ services:
   
   testssl:
     image: drwetter/testssl.sh:latest
+    platform: linux/amd64
     volumes: ["./data:/data"]
     working_dir: /data
   

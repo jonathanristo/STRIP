@@ -23,8 +23,9 @@ scan:
     depth: 2
     js_crawl: true
   tls:
-    testssl: true
-    sslyze: false
+    testssl: true       # deep TLS analysis → normalized into findings.ndjson (weak_tls)
+    sslyze: false       # RAW SIDECAR ONLY — writes sslyze.json but is NOT normalized into the contract
+                        # (testssl already feeds TLS findings); enable only if you want the raw artifact
 
 screenshots:
   enable: true
