@@ -28,10 +28,11 @@ check(){ # service "helpargs" flag...
 # Each row lists the flags stripctl actually passes that tool. (goflags treats -x and --x the same, so
 # stripctl's `--rate` is asserted via naabu's help form `-rate`.)
 check subfinder -h        -dL -all -silent -o
-check dnsx      -h        -l -r -a -aaaa -cname -json -silent -o
+check dnsx      -h        -l -r -a -aaaa -cname -json -silent -o -txt -caa
 check naabu     -h        -list -top-ports -rate -silent -o
 check nmap      -h        -6 -sV -p -oX -Pn -iL --version-light
-check httpx     -h        -l -rl -tls-grab -hash -json -o -status-code -title -tech-detect -server -content-type -content-length -location
+check asnmap    -h        -d -silent -o
+check httpx     -h        -l -rl -tls-grab -hash -json -o -status-code -title -tech-detect -server -content-type -content-length -location -favicon
 check katana    -h        -list -d -jc -silent -o
 check nuclei    -h        -severity -jsonl -l -o -stats -rl -c -ni
 # stripctl also passes testssl --fast: it still works but is DEPRECATED and omitted from --help, so it

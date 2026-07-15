@@ -64,6 +64,80 @@ assert_eq "sp_nuclei_target_list: includes katana crawl (sweep)" \
   "$(printf 'https://h.io:443\nhttps://h.io:443/admin\nhttps://h.io:443/login')" "$(sp_nuclei_target_list "$d")"
 rm -rf "$d"
 
+# ── sp_email_posture: absences → email_security findings; a fully-configured domain yields none ──
+d="$(mktemp -d)"
+printf 'good.com\nweak.com\nbad.com\n' > "$d/in_domains.txt"
+cat > "$d/email_txt.json" <<'EOF'
+{"host":"good.com","txt":["v=spf1 ~all"]}
+{"host":"_dmarc.good.com","txt":["v=DMARC1; p=reject"]}
+{"host":"_mta-sts.good.com","txt":["v=STSv1; id=1"]}
+{"host":"weak.com","txt":["v=spf1 ~all"]}
+{"host":"_dmarc.weak.com","txt":["v=DMARC1; p=none"]}
+EOF
+printf '{"host":"good.com","caa":["pki.goog"]}\n{"host":"weak.com","caa":["le.org"]}\n' > "$d/email_caa.json"
+SCAN_TS="TS"
+got="$(sp_email_posture "$d" | jq -r '.hostname_at_observation_time+"/"+.template_id' | sort | tr '\n' ' ')"
+want="bad.com/email-caa-missing bad.com/email-dmarc-missing bad.com/email-mta-sts-missing bad.com/email-spf-missing weak.com/email-dmarc-p-none weak.com/email-mta-sts-missing "
+assert_eq "sp_email_posture: flags absences, configured domain clean" "$want" "$got"
+assert_eq "sp_email_posture: every finding is category email_security" "email_security" \
+  "$(sp_email_posture "$d" | jq -rs 'map(.category)|unique|join(",")')"
+rm -rf "$d"
+
+# sp_email_posture: NO collection artifact (email_txt.json absent) → NO findings — "not assessed", not "all missing"
+d="$(mktemp -d)"; printf 'x.com\n' > "$d/in_domains.txt"
+assert_eq "sp_email_posture: missing artifact yields no findings (no false positives)" "" "$(SCAN_TS=TS sp_email_posture "$d")"
+rm -rf "$d"
+
+# sp_email_posture: MALFORMED artifact → not assessed (no findings), same as missing
+d="$(mktemp -d)"; printf 'x.com\n' > "$d/in_domains.txt"; printf '{bad json' > "$d/email_txt.json"
+assert_eq "sp_email_posture: malformed artifact yields no findings" "" "$(SCAN_TS=TS sp_email_posture "$d")"
+rm -rf "$d"
+
+# ── sp_takeover_findings: confirmed (nuclei match) vs potential (known-service CNAME); safe skipped ──
+d="$(mktemp -d)"
+cat > "$d/resolved.json" <<'EOF'
+{"host":"dangling.x.com","a":[],"cname":["gone.s3.amazonaws.com"]}
+{"host":"maybe.x.com","a":["1.1.1.1"],"cname":["app.herokuapp.com"]}
+{"host":"safe.x.com","a":["1.1.1.1"],"cname":["real.cdn.example.net"]}
+{"host":"plain.x.com","a":["1.1.1.1"],"cname":null}
+EOF
+printf '{"host":"dangling.x.com","template-id":"s3-takeover"}\n' > "$d/takeover.jsonl"
+SCAN_TS="TS"
+got="$(sp_takeover_findings "$d" | jq -r '.hostname_at_observation_time+"/"+.state+"/"+.severity' | sort | tr '\n' ' ')"
+assert_eq "sp_takeover_findings: confirmed+potential, safe/no-cname skipped" \
+  "dangling.x.com/confirmed/high maybe.x.com/potential/medium " "$got"
+assert_eq "sp_takeover_findings: category is takeover" "takeover" \
+  "$(sp_takeover_findings "$d" | jq -rs 'map(.category)|unique|join(",")')"
+rm -rf "$d"
+
+# sp_takeover_findings: URL-shaped nuclei .host still matches the bare hostname → confirmed, not potential
+d="$(mktemp -d)"
+printf '{"host":"dangle.x.com","a":[],"cname":["gone.s3.amazonaws.com"]}\n' > "$d/resolved.json"
+printf '{"host":"https://dangle.x.com:443/p","template-id":"s3"}\n' > "$d/takeover.jsonl"
+assert_eq "sp_takeover_findings: URL-shaped confirmed host normalizes to confirmed" "confirmed/high" \
+  "$(SCAN_TS=TS sp_takeover_findings "$d" | jq -r '.state+"/"+.severity')"
+rm -rf "$d"
+
+# sp_takeover_findings: MALFORMED takeover.jsonl → confirmed safely empty; potential findings STILL emit
+d="$(mktemp -d)"
+printf '{"host":"maybe.x.com","a":["1.1.1.1"],"cname":["app.herokuapp.com"]}\n' > "$d/resolved.json"
+printf '{bad json' > "$d/takeover.jsonl"
+assert_eq "sp_takeover_findings: malformed takeover.jsonl still emits potentials" "potential/medium" \
+  "$(SCAN_TS=TS sp_takeover_findings "$d" | jq -r '.state+"/"+.severity')"
+rm -rf "$d"
+
+# ── sp_seed_guard: refuse to expand with zero exclusions unless the whole ASN is acknowledged ──
+assert_eq "sp_seed_guard: 0 exclusions, unacknowledged → refuse" "refuse" "$(sp_seed_guard 0 false)"
+assert_eq "sp_seed_guard: 0 exclusions, acknowledged → expand"   "expand" "$(sp_seed_guard 0 true)"
+assert_eq "sp_seed_guard: with exclusions → expand"              "expand" "$(sp_seed_guard 3 false)"
+
+# ── sp_filter_cidrs: CONTAINMENT-aware — a broad exclusion drops CHILD CIDRs, not just exact matches ──
+ex="$(mktemp)"; printf '10.0.0.0/8\n172.16.0.0/12\n' > "$ex"
+assert_eq "sp_filter_cidrs: broad exclusion drops child CIDRs (v4 containment, v6 untouched)" \
+  "192.0.2.0/24 198.51.100.0/24 2001:db8::/48 " \
+  "$(printf '192.0.2.0/24\n10.1.2.0/24\n198.51.100.0/24\n172.16.5.0/24\n2001:db8::/48\n' | sp_filter_cidrs "$ex" | tr '\n' ' ')"
+rm -f "$ex"
+
 # ── latest_run_dir: sort by name (not mtime), accept zero-result runs, skip empty startup dir ──
 # (save/restore globals instead of a subshell, so the assertion actually counts toward the total)
 _sh="$STRIP_HOME"; _or="$OUTROOT"

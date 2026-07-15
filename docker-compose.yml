@@ -22,6 +22,14 @@ services:
     volumes: ["./data:/data"]
     working_dir: /data
   
+  asnmap:
+    image: projectdiscovery/asnmap:latest
+    environment:
+      - XDG_CONFIG_HOME=/data/.config
+      - PDCP_API_KEY=${PDCP_API_KEY:-}   # ProjectDiscovery Cloud key (read-only recon key, like subfinder's); required for seed expansion
+    volumes: ["./data:/data"]
+    working_dir: /data
+
   naabu:
     image: projectdiscovery/naabu:latest
     network_mode: host

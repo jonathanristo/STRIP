@@ -7,7 +7,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.bash"
 cd "$REPO"
 
 STREAMS=(dns hosts services web_assets tls findings)
-for fx in basic_v4 ipv6_bracket dualstack_nmap empty; do
+for fx in basic_v4 ipv6_bracket dualstack_nmap empty email_posture takeover seed_expansion; do
   [[ "$fx" == dualstack_nmap ]] && ! docker_ok && { echo "skip $fx (no docker)"; continue; }
   rd="$REPO/data/out/_regen_$fx"; rm -rf "$rd"; mkdir -p "$rd"; cp -R "$TESTS_DIR/fixtures/$fx/." "$rd/"
   ( cd "$REPO" && ./stripctl merge "$rd" ) >/dev/null 2>&1 || true

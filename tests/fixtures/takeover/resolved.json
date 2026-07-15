@@ -1,0 +1,4 @@
+{"host":"dangling.good.com","a":[],"aaaa":[],"cname":["abandoned.s3.amazonaws.com"]}
+{"host":"maybe.good.com","a":["198.51.100.9"],"aaaa":[],"cname":["myapp.herokuapp.com"]}
+{"host":"www.good.com","a":["198.51.100.9"],"aaaa":[],"cname":["dyna.wikimedia.org"]}
+{"host":"noalias.good.com","a":["198.51.100.9"],"aaaa":[],"cname":null}

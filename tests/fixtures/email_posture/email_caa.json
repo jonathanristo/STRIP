@@ -1,0 +1,2 @@
+{"host":"good.com","caa":["pki.goog"]}
+{"host":"weak.com","caa":["letsencrypt.org"]}

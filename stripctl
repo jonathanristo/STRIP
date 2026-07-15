@@ -89,6 +89,127 @@ sp_nuclei_target_list(){
     [[ -s "$d/katana.txt" ]] && cat "$d/katana.txt"
     true; } 2>/dev/null | sort -u
 }
+# email-posture assessment: reads a run dir's in_domains.txt + email_txt.json + email_caa.json and
+# emits email_security FINDINGS (absences/weaknesses) as findings.ndjson lines. Pure host-jq logic,
+# unit-tested in tests/parsers. The records themselves (facts) go into dns.ndjson via merge. DKIM/BIMI
+# are recorded but never flagged absent (selector-guessing / branding — too false-positive-prone).
+sp_email_posture(){
+  local d="$1" ts="${SCAN_TS:-1970-01-01T00:00:00Z}" txt='{}' caa='{}' caa_assessed=false
+  [[ -s "$d/in_domains.txt" ]] || return 0
+  # only assess when the TXT collection actually ran (email_txt.json exists). A MISSING artifact means
+  # "not assessed" (DNS/resolver/dnsx failure), NOT "all records missing" — this prevents false findings.
+  [[ -f "$d/email_txt.json" ]] || return 0
+  # a present-but-MALFORMED artifact is also "not assessed", not "empty DNS" — a jq parse failure skips
+  # it rather than defaulting to {} (which would emit false missing-record findings).
+  txt="$(jq -cs 'map({(.host): (.txt // [])}) | add // {}' "$d/email_txt.json" 2>/dev/null)" || return 0
+  if [[ -f "$d/email_caa.json" ]]; then
+    caa="$(jq -cs 'map({(.host): (.caa // [])}) | add // {}' "$d/email_caa.json" 2>/dev/null)" && caa_assessed=true || caa='{}'
+  fi
+  jq -R -c --argjson txt "$txt" --argjson caa "$caa" --argjson caa_assessed "$caa_assessed" --arg ts "$ts" '
+    . as $D | select($D != "")
+    | ($txt[$D] // [])                                          as $apex
+    | ($txt["_dmarc."+$D] // [])                                as $dmarc
+    | ($txt["_mta-sts."+$D] // [])                              as $mtasts
+    | ($caa[$D] // [])                                          as $caarec
+    | (any($apex[];  ascii_downcase|startswith("v=spf1")))      as $spf
+    | (any($dmarc[]; ascii_downcase|contains("v=dmarc1")))      as $has_dmarc
+    | ($dmarc | map(select(ascii_downcase|contains("v=dmarc1")))[0] // "") as $drec
+    | (($drec | ascii_downcase | capture("p=\\s*(?<p>none|quarantine|reject)").p)? // null) as $pol
+    | (any($mtasts[]; ascii_downcase|contains("v=stsv1")))      as $mtasts_ok
+    | (($caarec|length)>0)                                      as $caa_ok
+    | [ (if $spf|not then {sev:"medium",id:"email-spf-missing",title:"SPF record not published",
+           desc:"No v=spf1 TXT record at the domain apex; the domain is easier to spoof."} else empty end),
+        (if $has_dmarc|not then {sev:"medium",id:"email-dmarc-missing",title:"DMARC record not published",
+           desc:"No v=DMARC1 record at _dmarc; recipients have no policy for spoofed mail."}
+         elif $pol=="none" then {sev:"low",id:"email-dmarc-p-none",title:"DMARC policy is p=none (monitoring only)",
+           desc:"DMARC is published but not enforced (p=none)."} else empty end),
+        (if $mtasts_ok|not then {sev:"low",id:"email-mta-sts-missing",title:"MTA-STS not published",
+           desc:"No _mta-sts TXT record; SMTP TLS is not enforced via MTA-STS."} else empty end),
+        (if ($caa_assessed and ($caa_ok|not)) then {sev:"info",id:"email-caa-missing",title:"No CAA record",
+           desc:"No CAA record; any CA may issue certificates for this domain."} else empty end) ][]
+    | { source_module:"STRIP", source_tool:"dnsx", scan_id:$ts, observed_at:$ts,
+        ip_at_observation_time:null, hostname_at_observation_time:$D, hostname_resolvable:null,
+        url:null, port:null, category:"email_security", template_id:.id, cve_id:null, cwe_id:null,
+        title:.title, description:.desc, severity:.sev, cvss_score:null, cvss_vector:null,
+        matched_at:null, evidence:null, references:[], remediation:null, raw:null }
+  ' "$d/in_domains.txt"
+}
+# subdomain-takeover findings: candidates are CNAME'd hosts (resolved.json). CONFIRMED = the nuclei
+# takeover pass matched the host (fingerprint body); POTENTIAL = the CNAME points to a takeover-prone
+# service but nuclei did not confirm; SAFE is not emitted. Detection-only — STRIP never claims the
+# resource. Pure host-jq, unit-tested in tests/parsers.
+sp_takeover_findings(){
+  local d="$1" ts="${SCAN_TS:-1970-01-01T00:00:00Z}" confirmed='[]'
+  [[ -s "$d/resolved.json" ]] || return 0
+  # normalize confirmed hosts to a bare hostname — nuclei may emit URL-shaped .host / matched-at / url,
+  # which would otherwise never match resolved.json's bare hostname (downgrading confirmed → potential)
+  [[ -s "$d/takeover.jsonl" ]] && confirmed="$(jq -cs '[ .[] | (.host // .["matched-at"] // .url // "") | tostring
+      | sub("^[a-z]+://";"") | sub("[:/].*$";"") ] | map(select(.!="")) | unique' "$d/takeover.jsonl" 2>/dev/null)" || true
+  [[ "$confirmed" == \[* ]] || confirmed='[]'   # malformed takeover.jsonl → jq failed → keep a valid empty array (potentials still emit)
+  local svc='(github\.io|s3[.-]|amazonaws\.com|herokuapp\.com|herokudns\.com|netlify\.(app|com)|cloudfront\.net|azurewebsites\.net|cloudapp\.net|trafficmanager\.net|blob\.core\.windows\.net|fastly\.net|ghost\.io|pantheonsite\.io|readthedocs\.io|surge\.sh|bitbucket\.io|wpengine\.com|helpscoutdocs\.com)'
+  jq -c --argjson confirmed "$confirmed" --arg ts "$ts" --arg svc "$svc" '
+    ( .cname // null ) as $c
+    | ( if ($c|type)=="array" then ($c[0] // null) elif (($c|type)=="string" and $c!="") then $c else null end ) as $cn
+    | select($cn != null)                                        # only CNAME'"'"'d hosts are candidates
+    | .host as $h
+    | (($confirmed | index($h)) != null)   as $isconf
+    | (($cn|ascii_downcase) | test($svc))  as $svchit
+    | (if $isconf then "confirmed" elif $svchit then "potential" else "safe" end) as $state
+    | select($state != "safe")
+    | { source_module:"STRIP", source_tool:"nuclei", scan_id:$ts, observed_at:$ts,
+        ip_at_observation_time:null, hostname_at_observation_time:$h, hostname_resolvable:null,
+        url:null, port:null, category:"takeover", state:$state,
+        template_id:(if $isconf then "takeover-confirmed" else "takeover-potential" end),
+        cve_id:null, cwe_id:null,
+        title:("Possible subdomain takeover (" + $state + "): " + $h),
+        description:("Dangling CNAME " + $h + " -> " + $cn +
+          (if $isconf then ", confirmed claimable by the nuclei takeover pass."
+           else ", points to a takeover-prone service; verify manually." end)),
+        severity:(if $isconf then "high" else "medium" end),
+        cvss_score:null, cvss_vector:null, matched_at:null,
+        evidence:$cn, references:[], remediation:"Remove the dangling DNS record or re-claim the third-party resource.", raw:null }
+  ' "$d/resolved.json"
+}
+# seed-expansion scope-control guardrail: given the exclusion count and the acknowledge flag, decide
+# whether expansion may proceed. Refuses when there are ZERO exclusions unless expansion of the whole
+# ASN was explicitly acknowledged. Unit-tested in tests/parsers.
+sp_seed_guard(){  # $1 = exclusion count, $2 = acknowledge_full_asn -> prints "expand" | "refuse"
+  local n="${1:-0}" ack="${2:-false}"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  if [[ "$n" -eq 0 && "$ack" != "true" ]]; then echo "refuse"; else echo "expand"; fi
+}
+# filter a CIDR list (stdin) against an exclusion file ($1, one entry per line) by CONTAINMENT/overlap —
+# a child CIDR (10.1.2.0/24) is dropped when a broader exclusion (10.0.0.0/8) is set, and vice-versa.
+# Uses python3 ipaddress; falls back to exact-line match (with a warning) only if python3 is absent.
+# Empty/absent exclusion file → pass through. stdin→stdout. Unit-tested in tests/parsers.
+sp_filter_cidrs(){
+  local excl="${1:-}"
+  [[ -n "$excl" && -s "$excl" ]] || { cat; return 0; }
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'sp_filter_cidrs: python3 not found — CIDR exclusion is EXACT-MATCH only; install python3 for containment\n' >&2
+    grep -vxF -f "$excl" || true; return 0
+  fi
+  local tmp; tmp="$(mktemp)"; cat > "$tmp"   # capture stdin CIDRs to a file (heredoc below is python's script)
+  python3 - "$excl" "$tmp" <<'PY'
+import sys, ipaddress
+ex=[]
+for line in open(sys.argv[1]):
+    t=line.split('#',1)[0].strip()
+    if not t: continue
+    try: ex.append(ipaddress.ip_network(t, strict=False))
+    except ValueError: pass
+for line in open(sys.argv[2]):
+    c=line.strip()
+    if not c: continue
+    try: net=ipaddress.ip_network(c, strict=False)
+    except ValueError:
+        print(c); continue           # pass through anything unparseable
+    if any(net.version==e.version and net.overlaps(e) for e in ex):
+        continue                      # overlaps an exclusion → drop (conservative: never scan excluded)
+    print(c)
+PY
+  rm -f "$tmp"
+}
 
 setup() {
   echo "═══════════════════════════════════════════════"
@@ -183,6 +304,7 @@ discover(){
     fi
   done < "$OUT/domains.txt"
   log "inputs → domains:$(wc -l <"$OUT/in_domains.txt"|tr -d ' ') ips:$(wc -l <"$OUT/in_ips.txt"|tr -d ' ') cidrs:$(wc -l <"$OUT/in_cidrs.txt"|tr -d ' ')"
+  seed_expand   # opt-in: asnmap ASN→CIDR expansion into in_cidrs.txt (gated by the scope-control guardrail)
 
   # ── Subdomain discovery + DNS resolution (domains only) ───────────────────
   : > "$OUT/hosts_resolved.txt"
@@ -260,7 +382,7 @@ discover(){
     -l "/data/out/$TS/urls.txt" \
     -rl "$(yqg '.scan.httpx.rate_limit')" \
     -json -silent -status-code -title -tech-detect \
-    -server -content-type -content-length -location -hash sha256 -tls-grab \
+    -server -content-type -content-length -location -hash sha256 -tls-grab -favicon \
     -o "/data/out/$TS/httpx.json" || true
 
   # ── Crawl (sweep only): expand the URL surface so nuclei tests more than site roots ──
@@ -344,6 +466,88 @@ shots(){
   log "[✓] screenshots done."
 }
 
+email(){
+  [[ "$(yqg '.scan.email.enable')" == "true" ]] || { log "email posture disabled"; return 0; }
+  [[ -s "$OUT/in_domains.txt" ]] || { log "email posture: no domains — skipping"; return 0; }
+  log "email posture (SPF/DMARC/DKIM/BIMI/MTA-STS/CAA)…"
+  local sels; sels="$(yqg '.scan.email.dkim_selectors | join(" ")' 2>/dev/null)"
+  [[ -z "$sels" || "$sels" == "null" ]] && sels="default google selector1 selector2 k1"
+  # build the TXT query set: apex (SPF), _dmarc, _mta-sts, default._bimi, <selector>._domainkey per domain
+  : > "$OUT/.email_names.txt"
+  local dom s
+  while IFS= read -r dom; do
+    dom="${dom%$'\r'}"; [[ -n "$dom" ]] || continue
+    printf '%s\n_dmarc.%s\n_mta-sts.%s\ndefault._bimi.%s\n' "$dom" "$dom" "$dom" "$dom" >> "$OUT/.email_names.txt"
+    for s in $sels; do printf '%s._domainkey.%s\n' "$s" "$dom" >> "$OUT/.email_names.txt"; done
+  done < "$OUT/in_domains.txt"
+  # DNSSEC and DANE/TLSA are intentionally NOT assessed here — dnsx cannot query them (needs dig/other).
+  # materialize the artifact ONLY on success (even with 0 records) so posture assessment can tell
+  # "assessed, nothing found" from "collection failed" (removed → sp_email_posture skips → no false findings)
+  if crun dnsx -l "/data/out/$TS/.email_names.txt" -txt -json -silent -o "/data/out/$TS/email_txt.json" >/dev/null 2>"$OUT/email.err"; then
+    [[ -f "$OUT/email_txt.json" ]] || : > "$OUT/email_txt.json"
+  else
+    log "email dnsx(txt) exit $? — see email.err (email posture NOT assessed)"; rm -f "$OUT/email_txt.json"
+  fi
+  if crun dnsx -l "/data/out/$TS/in_domains.txt" -caa -json -silent -o "/data/out/$TS/email_caa.json" >/dev/null 2>>"$OUT/email.err"; then
+    [[ -f "$OUT/email_caa.json" ]] || : > "$OUT/email_caa.json"
+  else
+    log "email dnsx(caa) exit $? — see email.err (CAA not assessed)"; rm -f "$OUT/email_caa.json"
+  fi
+  log "[✓] email posture done."
+}
+
+takeover(){
+  [[ "$(yqg '.scan.takeover.enable')" == "true" ]] || { log "takeover detection disabled"; return 0; }
+  [[ -s "$OUT/resolved.json" ]] || { log "takeover: no resolved hosts — skipping"; return 0; }
+  # candidates = CNAME'd hosts; a dangling CNAME is the takeover vector. Accept string OR array cname
+  # (same normalization sp_takeover_findings uses) so every candidate also gets the nuclei confirm pass.
+  jq -r '( if (.cname|type)=="array" then (.cname[0] // null)
+           elif ((.cname|type)=="string" and .cname!="") then .cname else null end ) as $cn
+         | select($cn != null) | .host' "$OUT/resolved.json" 2>/dev/null | sort -u > "$OUT/.takeover_candidates.txt" || true
+  [[ -s "$OUT/.takeover_candidates.txt" ]] || { log "takeover: no CNAME candidates — skipping"; return 0; }
+  sed 's#^#https://#' "$OUT/.takeover_candidates.txt"  > "$OUT/.takeover_urls.txt"
+  sed 's#^#http://#'  "$OUT/.takeover_candidates.txt" >> "$OUT/.takeover_urls.txt"
+  local n; n="$(grep -c . "$OUT/.takeover_candidates.txt")"
+  log "subdomain takeover (nuclei -tags takeover) on $n CNAME candidate(s)…"
+  crun nuclei -tags takeover -l "/data/out/$TS/.takeover_urls.txt" -jsonl -silent -o "/data/out/$TS/takeover.jsonl" >/dev/null 2>"$OUT/takeover.err" \
+    || log "takeover nuclei exit $? — see takeover.err"
+  log "[✓] takeover detection done."
+}
+
+# seed expansion (opt-in): asnmap turns the input domains into their ASN's CIDRs and adds them to the
+# scan scope. This CHANGES WHAT IS SCANNED, so it is gated behind a scope-control guardrail (refuses to
+# expand without an exclusion list unless the full ASN is explicitly acknowledged). Needs a PDCP_API_KEY.
+seed_expand(){
+  [[ "$(yqg '.seed_expansion.enable')" == "true" ]] || return 0
+  [[ -s "$OUT/in_domains.txt" ]] || { log "seed expansion: no domains — skipping"; return 0; }
+  local nexcl ack
+  nexcl="$(yqg '.seed_expansion.exclusions | length' 2>/dev/null)"; [[ "$nexcl" =~ ^[0-9]+$ ]] || nexcl=0
+  ack="$(yqg '.seed_expansion.acknowledge_full_asn' 2>/dev/null)"
+  if [[ "$(sp_seed_guard "$nexcl" "$ack")" == "refuse" ]]; then
+    log "⚠ seed expansion enabled but NO exclusions set — refusing to expand scope."
+    log "   set seed_expansion.exclusions, or acknowledge_full_asn: true to scan the entire ASN."
+    return 0
+  fi
+  : > "$OUT/.seed_excl.txt"
+  [[ "$nexcl" -gt 0 ]] && yqg '.seed_expansion.exclusions[]' 2>/dev/null | grep -v '^null$' > "$OUT/.seed_excl.txt" || true
+  # exclusions are enforced by CIDR containment (python3); refuse rather than under-enforce the guardrail
+  if [[ -s "$OUT/.seed_excl.txt" ]] && ! command -v python3 >/dev/null 2>&1; then
+    log "⚠ seed expansion: python3 is required to enforce CIDR exclusions by containment — refusing to expand."
+    return 0
+  fi
+  local domlist; domlist="$(paste -sd, "$OUT/in_domains.txt" 2>/dev/null)"
+  log "seed expansion (asnmap → ASN CIDRs)…"
+  crun asnmap -d "$domlist" -silent -o "/data/out/$TS/asnmap.cidrs.txt" >/dev/null 2>"$OUT/asnmap.err" \
+    || log "asnmap exit $? — see asnmap.err (a PDCP_API_KEY is required)"
+  [[ -s "$OUT/asnmap.cidrs.txt" ]] || { log "seed expansion: asnmap returned no CIDRs (missing PDCP_API_KEY?)"; return 0; }
+  # apply exclusions BEFORE anything is scanned; the filtered set is the provenance record for the manifest
+  sort -u "$OUT/asnmap.cidrs.txt" | sp_filter_cidrs "$OUT/.seed_excl.txt" | sort -u > "$OUT/seed_expansion.cidrs.txt" || true
+  local nadd; nadd="$(grep -c . "$OUT/seed_expansion.cidrs.txt" 2>/dev/null || echo 0)"
+  cat "$OUT/seed_expansion.cidrs.txt" >> "$OUT/in_cidrs.txt"
+  sort -u -o "$OUT/in_cidrs.txt" "$OUT/in_cidrs.txt"
+  log "seed expansion: +$nadd CIDR(s) into scan scope ($nexcl exclusion rule(s) applied)"
+}
+
 # run_manifest.json (sensor-output/1.0 §5) — provenance + legal/authorization record
 manifest(){
   local R="$1" nowu dur authed streams counts nd ni nc s n
@@ -364,17 +568,24 @@ manifest(){
     if grep -q '"message":"No records' "$R/$s.ndjson"; then n=0; else n=$(grep -c '' "$R/$s.ndjson" 2>/dev/null || echo 0); fi
     counts=$(jq -c --arg k "$s" --argjson v "${n:-0}" '. + {($k):$v}' <<<"$counts")
   done
+  # seed-expansion provenance (asnmap): which CIDRs were added to scope and which exclusions applied
+  local seedj='null' seedci='[]' seedex='[]'
+  if [[ -s "$R/seed_expansion.cidrs.txt" ]]; then
+    seedci="$(jq -R . "$R/seed_expansion.cidrs.txt" | jq -cs 'map(select(.!=""))')"
+    [[ -s "$R/.seed_excl.txt" ]] && seedex="$(jq -R . "$R/.seed_excl.txt" | jq -cs 'map(select(.!=""))')"
+    seedj="$(jq -cn --argjson c "$seedci" --argjson e "$seedex" '{source:"asnmap", cidrs_added:$c, exclusions_applied:$e}')"
+  fi
   jq -n \
     --arg m STRIP --arg sid "$SCAN_TS" --arg prof "${PROFILE:-manual}" \
     --arg st "$SCAN_TS" --arg fin "$nowu" --argjson dur "$dur" \
     --arg op "$(id -un 2>/dev/null || echo user)@$(hostname -s 2>/dev/null || echo host)" \
     --arg auth "$authed" \
     --argjson tot "$((nd+ni+nc))" --argjson ips "$ni" --argjson cidrs "$nc" --argjson hn "$nd" \
-    --argjson streams "$streams" --argjson counts "$counts" \
+    --argjson streams "$streams" --argjson counts "$counts" --argjson seedexp "$seedj" \
     '{source_module:$m, scan_id:$sid, spec_version:"sensor-output/1.0", profile:$prof,
       started_at:$st, finished_at:$fin, duration_seconds:$dur, operator:$op, authorized_by:$auth,
       targets:{total:$tot, ips:$ips, cidrs:$cidrs, hostnames:$hn},
-      tool_versions:{}, streams_emitted:$streams, record_counts:$counts}' \
+      tool_versions:{}, streams_emitted:$streams, record_counts:$counts, seed_expansion:$seedexp}' \
     > "$R/run_manifest.json" 2>/dev/null || true
 }
 
@@ -410,6 +621,19 @@ merge(){
         hostname_resolvable: (if $name==null then null else ($resolved[$name] // true) end),
         record_type: .t, name: $name, value: .v, ttl: $ttl, root_domain: null, is_wildcard: null }
   ' "$R/resolved.json" > "$R/dns.ndjson" 2>/dev/null || true
+  # email-posture records (TXT/CAA) → dns facts, appended before the sentinel check
+  [[ -s "$R/email_txt.json" ]] && jq -c --arg ts "$SCAN_TS" '
+    .host as $n | (.txt // [])[] |
+    { source_module:"STRIP", source_tool:"dnsx", scan_id:$ts, observed_at:$ts,
+      ip_at_observation_time:null, hostname_at_observation_time:$n, hostname_resolvable:null,
+      record_type:"TXT", name:$n, value:., ttl:null, root_domain:null, is_wildcard:null }
+  ' "$R/email_txt.json" >> "$R/dns.ndjson" 2>/dev/null || true
+  [[ -s "$R/email_caa.json" ]] && jq -c --arg ts "$SCAN_TS" '
+    .host as $n | (.caa // [])[] |
+    { source_module:"STRIP", source_tool:"dnsx", scan_id:$ts, observed_at:$ts,
+      ip_at_observation_time:null, hostname_at_observation_time:$n, hostname_resolvable:null,
+      record_type:"CAA", name:$n, value:., ttl:null, root_domain:null, is_wildcard:null }
+  ' "$R/email_caa.json" >> "$R/dns.ndjson" 2>/dev/null || true
   _sent "$R/dns.ndjson"
 
   # ── hosts.ndjson (one record per observed IP) ─────────────────────────────
@@ -519,6 +743,7 @@ for host in root.findall("host"):
         content_length: (.content_length // null),
         redirect_url: (.location // null),
         response_hash: (.hash.body_sha256 // null),
+        favicon_hash: (.favicon | if (.==null or .=="") then null else (.|tostring) end),
         tech: ((.tech // []) | map({name:., version:null, category:null, confidence:null})),
         screenshot: ($shots[(.url // "")] // null) }
   ' "$R/httpx.json" > "$R/web_assets.ndjson" 2>/dev/null || true
@@ -604,6 +829,10 @@ for host in root.findall("host"):
         references: [], remediation: null, raw: . }
     | select(.severity | IN("low","medium","high","critical"))
   ' "$R/testssl.json" >> "$R/findings.ndjson" 2>/dev/null || true
+  # email-posture findings (absences/weaknesses) — appended before the sentinel check
+  sp_email_posture "$R" >> "$R/findings.ndjson" 2>/dev/null || true
+  # subdomain-takeover findings (confirmed|potential) from the CNAME candidates + nuclei takeover pass
+  sp_takeover_findings "$R" >> "$R/findings.ndjson" 2>/dev/null || true
   _sent "$R/findings.ndjson"
 
   # ── CSV summaries (lossy convenience; NDJSON is the contract) ──────────────
@@ -674,6 +903,8 @@ case "${1:-}" in
         webscan "$(yqg '.scan.nuclei.severity_daily')"
         tls
         shots
+        email
+        takeover
         merge
         ;;
       weekly)
@@ -683,6 +914,8 @@ case "${1:-}" in
         webscan "$(yqg '.scan.nuclei.severity_weekly')"
         tls
         shots
+        email
+        takeover
         merge
         ;;
       *) 

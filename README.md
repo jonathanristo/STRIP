@@ -28,19 +28,24 @@ STRIP automates the discovery and assessment of internet-facing assets through a
 
 ```
 targets.txt (domains / IPs / CIDRs) → subdomain discovery → DNS resolution
-            → port scanning → web probing → screenshots → crawling (sweep)
-            → vulnerability + TLS scanning → normalized reports
+            → [opt-in ASN seed expansion] → port scanning → web probing (+ favicon hash)
+            → screenshots → crawling (sweep) → vulnerability + TLS scanning
+            → subdomain-takeover + email-posture checks → normalized reports
 ```
 
 **Key Capabilities:**
 - 🔍 Automated subdomain enumeration
 - 🌐 DNS resolution and validation
 - 🎯 Domain, IP, and CIDR range targets
+- 🛰️ Opt-in ASN → CIDR seed expansion (asnmap, scope-controlled)
 - 🔓 Port and service discovery
 - 🌍 HTTP/HTTPS service profiling
+- 🧬 Favicon hashing (cross-host correlation anchor)
 - 🕸️ Web crawling for surface expansion (weekly sweep)
 - 📸 Screenshot capture / visual recon
 - 🛡️ Template-based vulnerability scanning
+- 🎭 Subdomain takeover detection (confirmed / potential)
+- ✉️ Email/domain security posture (SPF/DMARC/DKIM/BIMI/MTA-STS/CAA)
 - 🔒 TLS/SSL configuration assessment
 - 📊 Structured outputs (NDJSON, CSV)
 
@@ -122,6 +127,8 @@ scan:
   naabu:
     top_ports: "1000"    # Number of ports to scan
     rate: 5000           # Packets per second
+  httpx:
+    rate_limit: 400      # Requests per second
   nuclei:
     severity_daily: "high,critical"
     severity_weekly: "medium,high,critical"
@@ -129,6 +136,16 @@ scan:
     enable: true         # Web crawl during the weekly sweep (daily never crawls)
   tls:
     testssl: true        # TLS/SSL assessment of live HTTPS services
+    sslyze: false        # Raw sidecar only — writes sslyze.json but is NOT normalized into the contract
+  email:
+    enable: true         # SPF/DMARC/DKIM/BIMI/MTA-STS/CAA posture (dnsx TXT/CAA; DNSSEC/DANE not covered)
+  takeover:
+    enable: true         # Subdomain takeover via nuclei takeover templates over CNAME'd hosts
+
+seed_expansion:
+  enable: false          # OPT-IN: expand scope to the org's ASN CIDRs (asnmap). Changes WHAT is scanned
+  exclusions: []         # CIDRs excluded BEFORE scanning
+  acknowledge_full_asn: false   # allow expansion with an empty exclusion list. asnmap needs PDCP_API_KEY
 
 screenshots:
   enable: true           # Screenshot capture with gowitness
@@ -142,22 +159,26 @@ screenshots:
 data/out/20260709-143205/
 │   # ── raw tool output ──
 ├── domains.txt              # Input targets (domains / IPs / CIDRs)
-├── resolved.json            # DNS resolution (dnsx -json)
+├── resolved.json            # DNS resolution incl. CNAME chains (dnsx -json)
+├── email_txt.json           # SPF/DMARC/DKIM/BIMI/MTA-STS records (dnsx -txt)
+├── email_caa.json           # CAA records (dnsx -caa)
+├── asnmap.cidrs.txt         # ASN CIDRs (asnmap; opt-in seed expansion)
 ├── scan_targets.txt         # Combined port-scan targets
 ├── ports.naabu.txt          # Open ports (naabu)
-├── nmap.xml                 # Service fingerprints (nmap -oX; parsed by merge; also C2 import)
-├── httpx.json               # HTTP probe details (incl. TLS certificate grab)
+├── nmap.xml / nmap6.xml     # Service fingerprints, IPv4 / IPv6 (nmap -sV -Pn on discovered ports; C2 import)
+├── httpx.json               # HTTP probe details (incl. TLS grab + favicon hash)
 ├── nuclei.jsonl             # Raw vulnerability findings
+├── takeover.jsonl           # Raw subdomain-takeover matches (nuclei takeover pass)
 ├── testssl.json             # Raw TLS assessment
 ├── screenshots/             # gowitness screenshots
 │   # ── normalized output (stable NDJSON contract; one JSON object per line) ──
-├── hosts.ndjson             # One record per live host
-├── services.ndjson          # One record per (host, port) — naabu + nmap merged
-├── web_assets.ndjson        # One record per HTTP(S) endpoint
+├── hosts.ndjson             # One record per observed IP
+├── services.ndjson          # One record per (host, port, protocol) — naabu + nmap merged
+├── web_assets.ndjson        # One record per HTTP(S) endpoint (incl. favicon_hash)
 ├── tls.ndjson               # One record per TLS certificate (SHA-256 fingerprint)
-├── dns.ndjson               # One record per DNS observation
-├── findings.ndjson          # One record per finding (nuclei + testssl)
-├── run_manifest.json        # Run provenance: operator, timings, record counts
+├── dns.ndjson               # One record per DNS observation (A/AAAA/CNAME/TXT/CAA)
+├── findings.ndjson          # One record per finding (nuclei + testssl + email posture + takeover)
+├── run_manifest.json        # Run provenance: operator, authorization, timings, counts, seed-expansion
 └── *.csv                    # Lossy human-readable summaries (hosts, open_ports, web_assets, tls, findings)
 ```
 
@@ -171,11 +192,12 @@ STRIP leverages best-in-class open-source security tools:
 |-------|------|---------|
 | **Discovery** | [subfinder](https://github.com/projectdiscovery/subfinder) | Subdomain enumeration (passive) |
 | | [amass](https://github.com/owasp-amass/amass) | Subdomain enumeration (comprehensive) |
-| | [dnsx](https://github.com/projectdiscovery/dnsx) | DNS resolution & validation |
+| | [dnsx](https://github.com/projectdiscovery/dnsx) | DNS resolution, validation & email-posture records |
+| | [asnmap](https://github.com/projectdiscovery/asnmap) | ASN → CIDR seed expansion (opt-in; needs `PDCP_API_KEY`) |
 | **Scanning** | [naabu](https://github.com/projectdiscovery/naabu) | Fast port scanning |
-| | [nmap](https://nmap.org/) | Service fingerprinting |
-| | [httpx](https://github.com/projectdiscovery/httpx) | HTTP probing & tech detection |
-| **Assessment** | [nuclei](https://github.com/projectdiscovery/nuclei) | Vulnerability scanning (templates) |
+| | [nmap](https://nmap.org/) | Service fingerprinting (discovered ports, `-Pn`, IPv4 + IPv6) |
+| | [httpx](https://github.com/projectdiscovery/httpx) | HTTP probing, tech detection & favicon hashing |
+| **Assessment** | [nuclei](https://github.com/projectdiscovery/nuclei) | Vulnerability scanning + subdomain-takeover templates |
 | | [testssl.sh](https://testssl.sh/) | TLS/SSL security assessment |
 | **Recon** | [katana](https://github.com/projectdiscovery/katana) | Web crawling / surface expansion (weekly sweep) |
 | | [gowitness](https://github.com/sensepost/gowitness) | Screenshot capture / visual recon |
@@ -214,6 +236,22 @@ EOF
 ```
 
 See [docs/API_KEYS.md](docs/API_KEYS.md) for detailed setup instructions.
+
+### Seed Expansion Key (Optional)
+
+Opt-in ASN → CIDR seed expansion (`seed_expansion.enable: true`) uses **asnmap**, which needs a free
+[ProjectDiscovery Cloud](https://cloud.projectdiscovery.io) key. Provide it via the environment (it is
+passed through to the asnmap container):
+
+```bash
+export PDCP_API_KEY="your-pdcp-key"
+```
+
+Seed expansion **refuses to run without an exclusion list** unless you also set
+`seed_expansion.acknowledge_full_asn: true` — it changes *what* gets scanned, so scope control is a
+prerequisite, not an option. Exclusions are enforced by **CIDR containment** (a broad exclusion such as
+`10.0.0.0/8` also drops the child ranges asnmap returns), which needs `python3` on the host; if `python3`
+is absent while exclusions are set, expansion refuses rather than under-enforce the guardrail.
 
 ---
 
@@ -259,11 +297,15 @@ EOF
 
 ### Daily Scan (`stripctl run daily`) — Phase 1
 
-1. **discover** - Subdomain enumeration → DNS resolution → port scanning → HTTP probing
-2. **web-scan** - Nuclei templates (high/critical severity)
-3. **tls** - testssl.sh assessment of live HTTPS services
-4. **shots** - Screenshot capture (gowitness)
-5. **merge** - Normalize all outputs to NDJSON/CSV
+1. **discover** — subdomain enumeration → DNS resolution (+ CNAME) → naabu port scan → nmap `-sV -Pn` on the **discovered** ports (IPv4 + IPv6) → httpx probing (incl. favicon)
+2. **web-scan** — Nuclei (high/critical) against the **httpx-validated** live URLs (not the raw port cross-product)
+3. **tls** — testssl.sh assessment of live HTTPS services
+4. **shots** — Screenshot capture (gowitness)
+5. **email** — SPF/DMARC/DKIM/BIMI/MTA-STS/CAA posture (records → `dns.ndjson`, gaps → `findings.ndjson`)
+6. **takeover** — Subdomain-takeover detection over CNAME'd hosts (confirmed / potential)
+7. **merge** — Normalize all outputs to NDJSON/CSV
+
+> **Opt-in seed expansion:** with `seed_expansion.enable`, asnmap expands scope to the org's ASN CIDRs before scanning — scope-controlled (refuses without an exclusion list unless `acknowledge_full_asn`) and needs `PDCP_API_KEY`.
 
 **Duration:** ~10-30 minutes (depending on target size)
 
@@ -271,7 +313,7 @@ EOF
 
 Everything in the daily scan, plus a deeper **sweep**:
 - Amass (comprehensive subdomain discovery, unioned into one scan)
-- Katana (web crawling → expands the URL surface Nuclei tests)
+- Katana (web crawling → expands the validated URL set Nuclei tests)
 - Nuclei (medium/high/critical severity)
 
 **Duration:** ~30-90 minutes
@@ -290,8 +332,17 @@ jq 'select(.severity=="critical")' data/out/*/findings.ndjson
 # Findings that carry a CVE
 jq 'select(.cve_id != null) | {cve_id, severity, url}' data/out/*/findings.ndjson
 
+# Subdomain takeovers (confirmed or potential)
+jq 'select(.category=="takeover") | {host: .hostname_at_observation_time, state, severity}' data/out/*/findings.ndjson
+
+# Email-security gaps (missing SPF/DMARC/MTA-STS/CAA, DMARC p=none)
+jq 'select(.category=="email_security") | {host: .hostname_at_observation_time, .template_id}' data/out/*/findings.ndjson
+
 # Web assets running a given technology (tech is an array of objects)
 jq 'select(.tech[]?.name | ascii_downcase | test("wordpress"))' data/out/*/web_assets.ndjson
+
+# Favicon hashes (cross-host correlation anchor)
+jq -r 'select(.favicon_hash != null) | [.hostname_at_observation_time // .ip_at_observation_time, .favicon_hash] | @tsv' data/out/*/web_assets.ndjson
 
 # TLS certificate fingerprints (cross-host correlation anchor)
 jq -r '[.hostname_at_observation_time // .ip_at_observation_time, .fingerprint_sha256] | @tsv' data/out/*/tls.ndjson
@@ -325,28 +376,29 @@ findings_summary.csv - Findings
 │               Orchestration & Workflow Engine                │
 └─────────────────────────────────────────────────────────────┘
                             │
-                ┌───────────┼───────────┐
-                │           │           │
-        ┌───────▼──┐   ┌────▼────┐  ┌──▼──────┐
-        │subfinder │   │  dnsx   │  │ naabu   │
-        │  amass   │   │(resolve)│  │  nmap   │
-        └───────┬──┘   └────┬────┘  └──┬──────┘
-                │           │          │
-                └───────────┼──────────┘
-                            │
-                    ┌───────▼────────┐
-                    │     httpx      │
-                    │  (probe/tech)  │
-                    └───────┬────────┘
-                            │
-        ┌───────────┬───────┴───┬────────────┐
-        │           │           │            │
-   ┌────▼────┐ ┌────▼────┐ ┌────▼────┐ ┌──────▼─────┐
-   │ nuclei  │ │ testssl │ │ katana  │ │ gowitness  │
-   │ (vulns) │ │  (TLS)  │ │ (crawl) │ │ (screens)  │
-   └────┬────┘ └────┬────┘ └────┬────┘ └──────┬─────┘
-        │           │           │             │
-        └───────────┴─────┬─────┴─────────────┘
+       ┌───────────┬────────┼────────┬────────────┐
+       │           │        │        │            │
+  ┌────▼─────┐ ┌───▼────┐ ┌─▼──────┐ ┌▼──────────┐
+  │subfinder │ │  dnsx  │ │ naabu  │ │  asnmap   │
+  │  amass   │ │(resolve│ │  nmap  │ │ ASN→CIDR  │
+  │          │ │+email) │ │        │ │ (opt-in)  │
+  └────┬─────┘ └───┬────┘ └───┬────┘ └───────────┘
+       │           │          │
+       └───────────┴────┬─────┘
+                        │
+                ┌───────▼────────┐
+                │     httpx      │
+                │ (probe + favi) │
+                └───────┬────────┘
+                        │
+        ┌───────────┬───┴───┬────────────┐
+        │           │       │            │
+   ┌────▼────┐ ┌────▼────┐ ┌▼───────┐ ┌──▼─────────┐
+   │ nuclei  │ │ testssl │ │ katana │ │ gowitness  │
+   │ (vulns) │ │  (TLS)  │ │(crawl) │ │ (screens)  │
+   └────┬────┘ └────┬────┘ └───┬────┘ └──────┬─────┘
+        │           │          │             │
+        └───────────┴─────┬────┴─────────────┘
                           │
                   ┌───────▼────────┐
                   │     merge      │
@@ -354,8 +406,9 @@ findings_summary.csv - Findings
                   └────────────────┘
 ```
 
-> Phase 1 (`run daily`) flows discovery → httpx → nuclei → testssl → gowitness → merge. The weekly
-> sweep (`run weekly`) adds **amass** and **katana** (crawl → expands the surface nuclei tests).
+> Phase 1 (`run daily`) flows discovery → httpx → nuclei → testssl → gowitness → **email posture** →
+> **takeover** → merge. **asnmap** seed expansion is opt-in and feeds scan scope before naabu. The weekly
+> sweep (`run weekly`) adds **amass** and **katana** (crawl → expands the validated URL set nuclei tests).
 
 **Design Principles:**
 - **Containerized** - Every tool runs in isolation

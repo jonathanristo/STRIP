@@ -1,0 +1,6 @@
+{"host":"good.com","txt":["v=spf1 include:_spf.google.com ~all"]}
+{"host":"_dmarc.good.com","txt":["v=DMARC1; p=reject; rua=mailto:dmarc@good.com"]}
+{"host":"_mta-sts.good.com","txt":["v=STSv1; id=20260101"]}
+{"host":"default._domainkey.good.com","txt":["v=DKIM1; k=rsa; p=MIIBexample"]}
+{"host":"weak.com","txt":["v=spf1 ~all"]}
+{"host":"_dmarc.weak.com","txt":["v=DMARC1; p=none"]}

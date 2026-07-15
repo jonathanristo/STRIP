@@ -26,6 +26,16 @@ scan:
     testssl: true       # deep TLS analysis → normalized into findings.ndjson (weak_tls)
     sslyze: false       # RAW SIDECAR ONLY — writes sslyze.json but is NOT normalized into the contract
                         # (testssl already feeds TLS findings); enable only if you want the raw artifact
+  email:
+    enable: true        # SPF/DMARC/DKIM/BIMI/MTA-STS/CAA posture via dnsx TXT/CAA (DNSSEC/DANE not covered)
+    dkim_selectors: ["default", "google", "selector1", "selector2", "k1"]
+  takeover:
+    enable: true        # subdomain takeover: nuclei -tags takeover over CNAME'd hosts (confirmed|potential)
+
+seed_expansion:
+  enable: false               # OPT-IN: expand scan scope to the org's ASN CIDRs via asnmap (changes WHAT is scanned)
+  exclusions: []              # CIDRs to exclude BEFORE scanning (e.g. shared hosting / third-party ranges)
+  acknowledge_full_asn: false # allow expansion with an EMPTY exclusion list (whole ASN). asnmap needs PDCP_API_KEY
 
 screenshots:
   enable: true

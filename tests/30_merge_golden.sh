@@ -19,7 +19,7 @@ merge_fixture(){ # $1 fixture name -> sets globals RD (run dir) and MERGE_RC (me
   ( cd "$REPO" && ./stripctl merge "$RD" ) >/dev/null 2>&1; MERGE_RC=$?
 }
 
-for fx in basic_v4 ipv6_bracket dualstack_nmap empty; do
+for fx in basic_v4 ipv6_bracket dualstack_nmap empty email_posture takeover seed_expansion; do
   if needs_docker "$fx" && ! docker_ok; then skip "golden: $fx" "needs docker (nmap xmlparse)"; continue; fi
   merge_fixture "$fx"
 
@@ -58,6 +58,15 @@ sid2="$(jq -r '.scan_id' "$tsdir/services.ndjson" 2>/dev/null | head -1)"
 assert_eq "scan_id: derived from run-dir name (20200102-030405)" "2020-01-02T03:04:05Z" "$sid1"
 assert_eq "scan_id: stable across a re-merge of the same dir" "$sid1" "$sid2"
 rm -rf "$tsdir"
+
+# seed-expansion provenance (asnmap): run_manifest records the added CIDRs + applied exclusions
+sedir="$REPO/data/out/_test_seedprov"; rm -rf "$sedir"; mkdir -p "$sedir"; cp -R "$TESTS_DIR/fixtures/seed_expansion/." "$sedir/"
+( cd "$REPO" && ./stripctl merge "$sedir" ) >/dev/null 2>&1 || true
+assert_eq "seed_expansion: manifest records cidrs_added" "192.0.2.0/24,198.51.100.0/24" \
+  "$(jq -r '.seed_expansion.cidrs_added | join(",")' "$sedir/run_manifest.json" 2>/dev/null)"
+assert_eq "seed_expansion: manifest records exclusions_applied" "10.0.0.0/8" \
+  "$(jq -r '.seed_expansion.exclusions_applied | join(",")' "$sedir/run_manifest.json" 2>/dev/null)"
+rm -rf "$sedir"
 
 echo
 echo "  (to refresh the baseline after an intentional merge change: tests/regen_golden.sh)"
