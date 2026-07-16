@@ -126,6 +126,31 @@ For per-provider signup links and current rate limits, see
 
 ---
 
+## ProjectDiscovery Cloud key — asnmap / seed expansion (optional)
+
+The **opt-in** ASN → CIDR seed-expansion feature (`seed_expansion.enable: true` in `strip.yaml`) uses
+**[asnmap](https://github.com/projectdiscovery/asnmap)**, which requires a free
+[ProjectDiscovery Cloud](https://cloud.projectdiscovery.io) (PDCP) API key. Unlike the subfinder
+provider keys above, asnmap reads its key from an **environment variable**, not the provider-config file:
+
+```bash
+export PDCP_API_KEY="your-pdcp-key"
+./stripctl run daily
+```
+
+`docker-compose.yml` passes `PDCP_API_KEY` through to the asnmap container. It is the same *class* of key
+as the subfinder ones — a read-only credential to a public data provider, not access to a target — so it
+is allowed on the sensor but must never be committed.
+
+Without the key, asnmap exits immediately (STRIP feeds it `</dev/null`, so it does not hang), seed
+expansion logs a clear message, and the rest of the scan proceeds normally.
+
+> Seed expansion changes **what** gets scanned, so it is guarded: it refuses to expand without a
+> `seed_expansion.exclusions` list (unless `acknowledge_full_asn: true`), and enforces exclusions by CIDR
+> containment via `python3`. See the *Seed Expansion Key* section of the README.
+
+---
+
 ## Verify your keys work
 
 Run subfinder directly against a known domain and confirm authenticated sources fire:
